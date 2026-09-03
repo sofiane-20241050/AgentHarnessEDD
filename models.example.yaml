@@ -1,0 +1,22 @@
+# 三角色 LLM 端点配置示例（复制为 models.yaml 后填写）
+# 全部 OpenAI 兼容：vLLM / OpenRouter / 各家官方 API 均可
+# api key 一律从环境变量读取，本文件不落明文密钥
+
+agent:                      # 被测模型（考生）
+  name: qwen-local
+  base_url: http://localhost:8000/v1
+  model: Qwen3-32B
+  api_key_env: VLLM_API_KEY
+  temperature: 0.0
+
+user_simulator:             # 用户模拟器（按剧本扮演用户）
+  name: user-sim
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4.1
+  api_key_env: OPENROUTER_API_KEY
+
+judge:                      # 判分器（rubric 滑动窗口评估）
+  name: judge
+  base_url: https://openrouter.ai/api/v1
+  model: anthropic/claude-sonnet-4
+  api_key_env: OPENROUTER_API_KEY

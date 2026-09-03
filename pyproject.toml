@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentharness-edd"
+version = "0.1.0"
+description = "Evaluation-Driven Development (EDD) framework for AI agent harnesses: trace-native evaluation, per-stage failure diagnosis, and a bad-case-to-regression flywheel."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "sofiane-20241050" }]
+keywords = [
+  "agent", "agent-evaluation", "harness", "llm", "benchmark",
+  "evaluation-driven-development", "regression-testing", "trace", "observability",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+]
+
+dependencies = [
+  "click>=8.1",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "jinja2>=3.1",
+  "rich>=13.0",
+  "openai>=1.40",
+]
+
+[project.optional-dependencies]
+deepagents = ["deepagents", "langchain-openai"]
+tau = ["tau-ai; python_version>='3.12'"]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.scripts]
+ahedd = "ahedd.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ahedd"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
