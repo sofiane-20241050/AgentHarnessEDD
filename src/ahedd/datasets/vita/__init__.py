@@ -26,9 +26,37 @@ from ahedd.datasets.base import TaskCase, UserScenario
 from ahedd.env.base import default_diff
 from ahedd.env.tools import ToolDefinition
 
+
+class _force_utf8_open:
+    """临时把进程内 open() 的缺省编码固定为 UTF-8。
+
+    vita 源码在 Windows 中文区（默认 GBK）下 open() 不带 encoding 会读崩 UTF-8 数据；
+    本上下文管理器在"导入 vita / 读任务文件 / 执行工具"期间兜底，不修改第三方代码。
+    """
+
+    def __enter__(self) -> _force_utf8_open:
+        import builtins
+
+        self._original = builtins.open
+
+        def open_utf8(file, mode="r", *args, **kwargs):
+            if "r" in mode and "b" not in mode and "encoding" not in kwargs:
+                kwargs["encoding"] = "utf-8"
+            return self._original(file, mode, *args, **kwargs)
+
+        builtins.open = open_utf8
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        import builtins
+
+        builtins.open = self._original
+
+
 try:
-    from vita.domains.delivery.environment import get_environment as _get_delivery_env
-    from vita.domains.delivery.environment import get_tasks as _get_delivery_tasks
+    with _force_utf8_open():
+        from vita.domains.delivery.environment import get_environment as _get_delivery_env
+        from vita.domains.delivery.environment import get_tasks as _get_delivery_tasks
 
     _VITA_AVAILABLE = True
 except ImportError:  # 未安装 vita 包时插件静默不注册（datasets 加载器按 ImportError 跳过）
@@ -86,7 +114,11 @@ def _wrap_tool(vita_env: Any, tool: Any) -> ToolDefinition:
     schema.pop("title", None)
 
     async def call(**kwargs: Any) -> Any:
-        return await asyncio.to_thread(vita_env.use_tool, tool_name=tool.name, **kwargs)
+        def _run() -> Any:
+            with _force_utf8_open():
+                return vita_env.use_tool(tool_name=tool.name, **kwargs)
+
+        return await asyncio.to_thread(_run)
 
     return ToolDefinition(
         name=tool.name,
@@ -97,6 +129,11 @@ def _wrap_tool(vita_env: Any, tool: Any) -> ToolDefinition:
 
 
 def _load_vita_tasks(domain: str, language: str) -> list[Any]:
+    with _force_utf8_open():  # vita 以默认编码读任务 JSON，Windows 中文区需兜底 UTF-8
+        return _load_vita_tasks_inner(domain, language)
+
+
+def _load_vita_tasks_inner(domain: str, language: str) -> list[Any]:
     lang = _LANGUAGES.get(language, None)
     if domain == "delivery":
         return _get_delivery_tasks(language=lang)

@@ -10,4 +10,13 @@
   report     单文件 HTML 诊断报告
 """
 
+from __future__ import annotations
+
+import os
+
+# Windows 中文区默认编码为 GBK：第三方数据集代码常直接 open() 不带 encoding，
+# 读 UTF-8 数据会 UnicodeDecodeError。置 PYTHONUTF8 使本框架拉起的子进程
+# （如本地 MCP server）进入 UTF-8 模式；当前进程内的兼容见 vita 插件的 _force_utf8_open。
+os.environ.setdefault("PYTHONUTF8", "1")
+
 __version__ = "0.1.0"
