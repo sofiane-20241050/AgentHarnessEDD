@@ -42,7 +42,12 @@ def _load_builtin_adapters() -> None:
     """导入内置适配器模块以触发自注册（可延迟、可失败：按需安装 extra）。"""
     from importlib import import_module
 
-    for mod in ("ahedd.adapters.openai_loop", "ahedd.adapters.deepagents_adapter", "ahedd.adapters.tau_adapter"):
+    for mod in (
+        "ahedd.adapters.openai_loop",
+        "ahedd.adapters.deepagents_adapter",
+        "ahedd.adapters.tau_adapter",
+        "ahedd.adapters.claude_code_adapter",
+    ):
         try:
             import_module(mod)
         except ImportError:

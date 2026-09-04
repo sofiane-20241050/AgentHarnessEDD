@@ -62,6 +62,7 @@ def run_cmd(
     """跑评测：采集轨迹 + 确定性断言（rubric 判分用 ahedd score 离线执行，先存后判）。"""
     import asyncio
     import json as _json
+    import os
 
     from ahedd.config import load_models_config
     from ahedd.datasets import get_dataset
@@ -94,6 +95,14 @@ def run_cmd(
             from ahedd.adapters.tau_adapter import TauAdapter
 
             return TauAdapter(agent_spec)
+        if adapter == "claude-code":
+            from ahedd.adapters.claude_code_adapter import ClaudeCodeAdapter
+
+            return ClaudeCodeAdapter(
+                workdir=os.environ.get("AHEDD_CC_DIR", "."),
+                ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
+                node_bin=os.environ.get("AHEDD_CC_NODE_BIN", "~/.nvm/versions/node/v22.22.0/bin"),
+            )
         raise click.UsageError(f"未知 adapter: {adapter!r}（见 ahedd adapters list）")
 
     def _print_result(case, outcome, trial: int) -> None:
