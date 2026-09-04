@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 
 TOOL_CALL_RE = re.compile(r"```json\s*(\{.*?tool_call.*?\})\s*```", re.DOTALL)
 
+
+class ClaudeLoopDetectedError(RuntimeError):
+    """CC 在一次 -p 内对同一工具连续调用超过熔断阈值（事件流实时判定）。"""
+
+
 _BRIEF_TEMPLATE = (
     "# DOMAIN TOOLS (system-provided; NOT your built-in tools)\n"
     "{catalog}\n\n"
@@ -66,7 +71,7 @@ class ClaudeCodeAdapter:
         workdir: str,
         ssh_target: str | None = None,
         node_bin: str = "~/.nvm/versions/node/v22.22.0/bin",
-        timeout: int = 300,
+        timeout: int = 900,
         max_turns: int = 20,
         system_prompt: str | None = None,
         tool_mode: str = "text",
@@ -74,7 +79,11 @@ class ClaudeCodeAdapter:
         mcp_url: str = "http://127.0.0.1:8023/mcp",
         events_file: str | None = None,
         events_ssh_target: str | None = None,
+        on_event: Any = None,
+        max_identical_calls: int = 10,
     ) -> None:
+        """:param on_event: 实时事件回调（stream-json 逐行：assistant 消息/工具调用等），
+            用于评测过程中的逐 turn 可见性；回调异常不影响主流程。"""
         """:param ssh_target: 形如 "user@remote-host"（经 ssh 在远端执行 claude）；None 则本地子进程执行。
         :param workdir: claude 的工作目录（.claude/settings.local.json 生效范围）。
         :param node_bin: claude 所在的 nvm bin 目录（远端 PATH 注入）。
@@ -96,6 +105,9 @@ class ClaudeCodeAdapter:
         self.mcp_url = mcp_url
         self.events_file = events_file
         self.events_ssh_target = events_ssh_target
+        self.on_event = on_event
+        # CC 级熔断：事件流中同一工具连续调用超过该次数即杀进程（防死循环烧 token）
+        self.max_identical_calls = max(10, max_identical_calls)
 
     # ---- 子进程执行（阻塞，由 run 内 to_thread 包装） ----
 
@@ -105,12 +117,21 @@ class ClaudeCodeAdapter:
         session_id: str | None,
         append_system: str | None,
         extra_flags: list[str] | None = None,
+        on_event: Any = None,
     ) -> dict[str, Any]:
+        """驱动一次 claude -p。
+
+        采用 stream-json 输出：逐行读取事件流（system/assistant/user），实时回调
+        on_event（逐 turn 可见），末行 result 即最终结果（与 json 格式同构）。
+        超时以定时器杀进程实现（阻塞 readline 无法被中断）。
+        """
+        import threading
+
         flags = list(extra_flags or [])
         if self.ssh_target:
             script = (
                 f"export PATH={self.node_bin}:$PATH && cd {shlex.quote(self.workdir)} "
-                "&& claude -p --output-format json"
+                "&& claude -p --verbose --output-format stream-json"
             )
             if session_id:
                 script += f" --resume {shlex.quote(session_id)}"
@@ -121,7 +142,7 @@ class ClaudeCodeAdapter:
             cmd: list[str] = ["tsh", "ssh", self.ssh_target, script]
             env = None
         else:
-            cmd = ["claude", "-p", "--output-format", "json"]
+            cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
             if session_id:
                 cmd += ["--resume", session_id]
             if append_system:
@@ -130,23 +151,83 @@ class ClaudeCodeAdapter:
             env = dict(os.environ)
             env["PATH"] = os.path.expanduser(self.node_bin) + os.pathsep + env.get("PATH", "")
 
+        stderr_tail: list[str] = []
+
+        def _drain_stderr(stream: Any) -> None:
+            for line in stream:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 20:
+                    stderr_tail.pop(0)
+
+        timed_out = False
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", env=env,
+        )
+
+        def _kill_on_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        timer = threading.Timer(self.timeout, _kill_on_timeout)
+        timer.start()
+        result: dict[str, Any] | None = None
+        nonlocal_last = [None]
+        nonlocal_streak = [0]
+        loop_tool = [None]
         try:
-            proc = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",  # claude 输出为 UTF-8，勿随解释器 locale（Windows 中文区为 GBK）
-                timeout=self.timeout, env=env, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"claude CLI timed out after {self.timeout}s") from exc
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude CLI failed ({proc.returncode}): {proc.stderr[-500:]}")
-        try:
-            data = json.loads(proc.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError) as exc:
-            raise RuntimeError(f"claude output not JSON: {proc.stdout[:300]}") from exc
-        if data.get("is_error"):
-            raise RuntimeError(f"claude reported error: {str(data.get('result'))[:300]}")
-        return data
+            drain = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+            drain.start()
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "result":
+                    result = event
+                    continue
+                # 熔断：assistant 事件里的 tool_use 块统计同工具连击
+                if event.get("type") == "assistant":
+                    for block in (event.get("message") or {}).get("content") or []:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_name = str(block.get("name") or "")
+                            nonlocal_streak[0] = nonlocal_streak[0] + 1 if tool_name == nonlocal_last[0] else 1
+                            nonlocal_last[0] = tool_name
+                            if nonlocal_streak[0] > self.max_identical_calls:
+                                loop_tool[0] = tool_name
+                                _kill_on_timeout()  # 复用杀进程（置位 timed_out 无妨，异常类型在下方改判）
+                                break
+                if on_event is not None:
+                    try:
+                        on_event(event)
+                    except Exception:  # noqa: BLE001, S110 - 展示回调不允许影响主流程
+                        pass
+                if loop_tool[0]:
+                    break
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+        if result is None:
+            detail = "".join(stderr_tail)[-500:] or "(无 stderr)"
+            if loop_tool[0]:
+                raise ClaudeLoopDetectedError(
+                    f"CC loop detected: {loop_tool[0]} x{nonlocal_streak[0]} (circuit breaker)"
+                )
+            if timed_out:
+                raise TimeoutError(f"claude CLI timed out after {self.timeout}s（未产生 result 事件）")
+            raise RuntimeError(f"claude CLI 未返回 result：exit={proc.returncode}, stderr={detail}")
+        if result.get("is_error"):
+            raise RuntimeError(f"claude reported error: {str(result.get('result'))[:300]}")
+        return result
 
     # ---- 适配器主循环 ----
 
@@ -190,7 +271,9 @@ class ClaudeCodeAdapter:
 
         for _dialog_turn in range(self.max_turns):
             flags = init_flags if session_id is None else ["--resume", session_id]
-            data = await asyncio.to_thread(self._call_claude, prompt, None, None, flags)
+            data = await asyncio.to_thread(
+                self._call_claude, prompt, None, None, flags, self.on_event
+            )
             session_id = data.get("session_id") or session_id
 
             raw_usage = data.get("usage") or {}
@@ -308,7 +391,9 @@ class ClaudeCodeAdapter:
 
         for turn in range(self.max_turns):
             append_system = brief if session_id is None else None
-            data = await asyncio.to_thread(self._call_claude, text, session_id, append_system)
+            data = await asyncio.to_thread(
+                self._call_claude, text, session_id, append_system, None, self.on_event
+            )
             session_id = data.get("session_id") or session_id
 
             raw_usage = data.get("usage") or {}

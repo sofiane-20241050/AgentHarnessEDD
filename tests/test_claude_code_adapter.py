@@ -30,7 +30,7 @@ async def test_e2e_text_protocol_bridge(tmp_path, monkeypatch) -> None:
     ]
     calls: list[tuple[str, str | None, str | None]] = []
 
-    def fake_call(self, prompt, session_id, append_system):
+    def fake_call(self, prompt, session_id, append_system, flags=None, on_event=None):
         calls.append((prompt, session_id, append_system))
         return script[len(calls) - 1]
 

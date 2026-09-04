@@ -1,6 +1,5 @@
 """用户模拟器测试：双 FakeLLM（Agent 侧 + 用户侧）离线验证多轮对话模式。"""
 
-import pytest
 
 from ahedd.adapters.openai_loop import OpenAILoopAdapter
 from ahedd.datasets import get_dataset

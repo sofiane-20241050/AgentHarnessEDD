@@ -57,6 +57,7 @@ def adapters_cmd() -> None:
 )
 @click.option("--mcp-port", default=8023, show_default=True, help="MCP server 端口（tool-mode=mcp 时）")
 @click.option("--no-user-sim", is_flag=True, help="禁用用户模拟器（默认：配置了 AHEDD_USER_SIMULATOR_* 且任务带剧本时启用）")
+@click.option("--cc-timeout", default=900, show_default=True, help="claude-code 车道：单次 claude -p 子进程超时（秒，含其内部工具循环）")
 def run_cmd(
     dataset: str,
     domain: str | None,
@@ -70,6 +71,7 @@ def run_cmd(
     tool_mode: str,
     mcp_port: int,
     no_user_sim: bool,
+    cc_timeout: int,
 ) -> None:
     """跑评测：采集轨迹 + 确定性断言（rubric 判分用 ahedd score 离线执行，先存后判）。"""
     import asyncio
@@ -97,6 +99,21 @@ def run_cmd(
 
     # --max-tokens 对所有适配器生效：统一写进 agent spec
     agent_spec = roles.agent.model_copy(update={"max_tokens": max_tokens})
+
+    def _cc_live_print(event: dict) -> None:
+        """claude-code 实时事件（stream-json）：逐 turn 可见工具调用与回复片段。"""
+        import json as _j
+
+        if event.get("type") != "assistant":
+            return
+        for block in (event.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                args = _j.dumps(block.get("input") or {}, ensure_ascii=False)
+                click.echo(f"    · CC→ {block.get('name')}({args[:90]})")
+            elif block.get("type") == "text" and (block.get("text") or "").strip():
+                click.echo(f"    · CC: {(block.get('text') or '')[:90]!r}")
 
     def factory():
         if adapter == "openai-loop":
@@ -127,10 +144,12 @@ def run_cmd(
                 workdir=os.environ.get("AHEDD_CC_DIR", "."),
                 ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
                 node_bin=os.environ.get("AHEDD_CC_NODE_BIN", "~/.nvm/versions/node/v22.22.0/bin"),
+                timeout=cc_timeout,
                 tool_mode=tool_mode,
                 mcp_url=_mcp_url,
                 events_file=_mcp_events_file,
                 events_ssh_target=_mcp_events_ssh,
+                on_event=_cc_live_print,
             )
         raise click.UsageError(f"未知 adapter: {adapter!r}（见 ahedd adapters list）")
 
