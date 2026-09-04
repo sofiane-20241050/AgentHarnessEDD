@@ -1,25 +1,18 @@
-# examples/ —— 实战示例
+# examples/ —— 可运行示例
 
-以完整可跑的例子展示框架的典型用法（每个子目录自带 README 与运行脚本）。
+| 示例 | 内容 |
+|---|---|
+| [`vitabench_claude_code/`](vitabench_claude_code/) | 完整实战：用 Claude Code CLI + 任意 OpenAI 兼容模型跑 VitaBench 真实任务，出分出报告 |
+| [`custom_dataset/`](custom_dataset/) | 15 分钟接入你自己的业务数据集（Provider + Environment + 任务） |
+| [`custom_adapter/`](custom_adapter/) | 15 分钟接入你自己的 Agent Harness 作为被测对象 |
 
-## 计划中的示例
+## 环境准备（所有示例通用）
 
-### `vitabench_mcp/` —— 学术基准经 MCP 供给任意 Agent
+```bash
+git clone https://github.com/sofiane-20241050/AgentHarnessEDD && cd AgentHarnessEDD
+uv venv .venv && uv pip install -e ".[dev,mcp]"
+cp .env.example .env        # 填入你自己的模型端点（任意 OpenAI 兼容服务）
+```
 
-把 VitaBench 的域环境（工具 + 虚拟数据库 + 任务/rubric）包装为 `ahedd` 的
-`DatasetProvider`，再以 MCP server 形式供给被测对象（Claude Code / DeepAgents /
-任何 MCP 客户端），跑完整"run → score → 报告"流程。
-
-学术 bench 的环境是 python 对象（非网络服务），通用 MCP 化需要逐域适配其工具实现——
-因此按"数据集插件 + 示例流程"的形式放在 examples，而非核心包。
-
-### `harness_ablation/` —— 同模型四车道消融
-
-同一模型（vLLM 部署）、同一数据集（mock / vita）、四种 harness
-（openai-loop / DeepAgents / tau / Claude Code），对比成功率、Step-to-Success
-与 token 成本的帕累托曲线。
-
-## 已内建的示例
-
-mock 数据集（框架自测域）即内置示例：`ahedd run --dataset mock` + `ahedd score`，
-参见根 README 的快速开始。
+框架本身不绑定任何模型服务商：被测模型、用户模拟器、判分器三个角色都在 `.env` 里
+用 `AHEDD_{AGENT|USER_SIMULATOR|JUDGE}_{MODEL,BASE_URL,API_KEY}` 独立配置。
