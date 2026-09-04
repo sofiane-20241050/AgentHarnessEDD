@@ -324,7 +324,8 @@ def run_cmd(
 @click.option("--think", is_flag=True, help="判分模型开启思考（默认关闭以保证 JSON 输出）")
 @click.option("--strict-state", is_flag=True, help="强制开启终态断言（expected_states 字段级比对；官方基准默认关闭以对齐论文口径）")
 @click.option("--no-state-check", is_flag=True, help="强制关闭终态断言")
-def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bool, think: bool, strict_state: bool, no_state_check: bool) -> None:
+@click.option("--force", is_flag=True, help="强制重新判分（跳过已有 .score.json 的轨迹也重判）")
+def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bool, think: bool, strict_state: bool, no_state_check: bool, force: bool) -> None:
     """离线判分：读轨迹 -> rubric 滑窗 judge + 轨迹动力学指标 -> 结果落盘（先存后判）。"""
     import asyncio
     import json as _json
@@ -378,6 +379,30 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
         score_value = None
         rubric_detail: list = []
         state_violations: list = []
+        _sidecar = trace_file.with_suffix(".score.json")
+
+        # 跳过已判分轨迹（除非 --force）
+        if not force and _sidecar.exists():
+            try:
+                _cached = _json.loads(_sidecar.read_text(encoding="utf-8"))
+                passed = _cached.get("passed")
+                score_value = _cached.get("score")
+                rubric_detail = _cached.get("rubric_results") or []
+                state_violations = _cached.get("state_violations") or []
+                metrics = compute_trajectory_metrics(trajectory)
+                # 跳过打印（不加 [SKIP] 前缀，和正常输出一致但标注 cached）
+                click.echo(
+                    f"[{'PASS' if passed else 'FAIL'}] {meta.task_id} adapter={meta.adapter} "
+                    f"rubric={sum(r.get('satisfied', False) for r in rubric_detail)}/{len(rubric_detail)} "
+                    f"score={score_value if score_value is not None else '-'} "
+                    f"(cached) turns={metrics.turns} useful={metrics.useful_action_ratio} "
+                    f"errs={metrics.error_events} tokens={metrics.tokens_in}/{metrics.tokens_out}"
+                )
+                suite_rows.append((meta.adapter, meta.task_id, passed, metrics))
+                continue
+            except Exception:  # noqa: BLE001, S110 - 缓存损坏则重判
+                pass
+
         if scorer is not None and case.rubrics:
             report = asyncio.run(scorer.score(case, trajectory))
             # 终态断言策略：显式 flag > 数据集策略
