@@ -109,11 +109,12 @@ AgentHarnessEDD/
 
 ## Roadmap
 
-- [ ] **D1** environment + dataset onboarding: `vita` dataset plugin (openai-loop adapter & mock domain already validated with a real model)
+- [x] **D1** `vita` dataset plugin (real VitaBench tasks: rubric scoring with partial credit, loop circuit breaker, first regression case RC-0001 frozen)
 - [x] **D2** more lanes: DeepAgents and tau in-process adapters (validated with a real model); trajectory JSONL persistence
 - [x] **D3** dual scoring channels + metrics: rubric sliding-window judge (validated with a real model; catches the tau refuses-to-edit bad case), deterministic assertions, trajectory-dynamics metrics (useful-action ratio / error recovery / STS / pareto), offline `ahedd score`
-- [ ] **D4** HTML diagnostic report + `ahedd freeze` regression-freezing demo
-- [ ] dataset plugins via entry-points; enterprise-private dataset authoring guide
+- [x] **D4** single-file HTML diagnostic report + `ahedd freeze` (auto triage: loop/param/unfinished/constraint)
+- [x] MCP deepening: deepagents MCP mode, per-case server restart (no cross-case env pollution)
+- [ ] dataset entry-points, private-set authoring guide, user simulator, `ahedd ci` gate
 
 ## Docs
 

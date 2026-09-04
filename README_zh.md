@@ -109,11 +109,12 @@ AgentHarnessEDD/
 
 ## 路线图
 
-- [ ] **D1** 环境与数据集接入：`vita` 数据集插件（openai-loop 适配器与 mock 自测域已跑通真模型）
+- [x] **D1** `vita` 数据集插件（VitaBench 真任务跑通：rubric 判分含部分得分、循环熔断、首个回归用例 RC-0001 已冻结）
 - [x] **D2** 第二/三被测车道：DeepAgents、tau 进程内适配器（已接真模型验证）；轨迹 JSONL 落盘
 - [x] **D3** 判分双通道 + 指标：rubric 滑窗 judge（真模型验证，可抓 tau 拒改址类 bad case）、确定性断言、轨迹动力学指标（有效动作比/错误恢复/STS/帕累托）、`ahedd score` 离线判分
-- [ ] **D4** HTML 诊断报告 + `ahedd freeze` 回归冻结演示
-- [ ] 数据集插件化（entry-points）、企业私有集工作流指南
+- [x] **D4** 单文件 HTML 诊断报告 + `ahedd freeze` 回归冻结（自动归因预判：loop/param/unfinished/constraint）
+- [x] MCP 深化：deepagents MCP 模式、server 按 case 重启（消除多任务环境污染）
+- [ ] 数据集插件化（entry-points）、企业私有集工作流指南、用户模拟器多轮交互、`ahedd ci` 门禁
 
 ## 文档
 
