@@ -40,6 +40,7 @@ async def run_dataset(
     concurrency: int = 1,
     on_result: Callable[[TaskCase, CaseOutcome, int], None] | None = None,
     case_setup: Callable[[TaskCase], Any] | None = None,
+    user_simulator_factory: Callable[[TaskCase], Any] | None = None,
 ) -> list[tuple[TaskCase, CaseOutcome]]:
     """批量跑一个数据集域：每任务独立环境、独立适配器实例；trials 次采样（Pass^k 基础）。
 
@@ -47,6 +48,8 @@ async def run_dataset(
     :param on_result: 每完成一条立即回调 (case, outcome, trial)——进度展示用。
     :param case_setup: 每个任务开始前调用（同步或 async）——如 MCP server 按 case 重启；
         与并发互斥（per-case 全局资源只能串行）。
+    :param user_simulator_factory: 任务 -> UserSimulator 工厂（双 LLM 交互数据集用，
+        目前 openai-loop 车道支持多轮对话模式）。
     """
     if case_setup is not None and concurrency > 1:
         raise ValueError("case_setup（按 case 重启等）与 concurrency>1 互斥")
@@ -68,11 +71,13 @@ async def run_dataset(
                 dataset=dataset or provider.name,
                 adapter=adapter_factory(),
                 env=env,
+                case=case,
                 task_id=case.id,
                 instruction=case.instruction,
                 env_seed=case.env_seed,
                 trace_dir=trace_dir,
                 agent_model=agent_model,
+                user_simulator_factory=user_simulator_factory,
             )
             if on_result:
                 on_result(case, outcome, trial)
@@ -94,10 +99,14 @@ async def run_case(
     env_seed: int | None = None,
     trace_dir: str = "runs",
     agent_model: str = "",
+    case: TaskCase | None = None,
+    user_simulator_factory: Callable[[TaskCase], Any] | None = None,
 ) -> CaseOutcome:
     """评测单任务一次。
 
-    多轮交互（用户模拟器）在 D3 接入：当前版本先支持单轮指令直跑。
+    多轮交互：提供 user_simulator_factory 时（数据集任务携带剧本/画像），
+    用户模拟器产出开场白并逐轮回应 Agent 的终答（###STOP### 结束）；
+    模拟器用量并入 total_usage。未提供时为单轮指令直跑。
     """
     meta = RunMeta(
         task_id=task_id, domain=env.domain, dataset=dataset, adapter=adapter.name, agent_model=agent_model
@@ -107,17 +116,30 @@ async def run_case(
     await env.reset(env_seed)
     before = env.snapshot()
 
+    simulator = None
+    if user_simulator_factory is not None and case is not None:
+        simulator = user_simulator_factory(case)
+        opening = await simulator.start()
+        instruction = opening  # Agent 的首轮输入是模拟器说出的"人话"，而非原始剧本
     recorder.note("user", content=instruction)
     tools = [recorder.wrap_tool(t) for t in env.tools()]
     task = TaskInput(task_id=task_id, instruction=instruction, system_prompt=system_prompt)
 
     try:
-        result = await adapter.run(task, tools, recorder)
+        run_kwargs = {}
+        if simulator is not None:
+            run_kwargs["user_responder"] = simulator.reply
+        result = await adapter.run(task, tools, recorder, **run_kwargs)
         u = result.usage_total or {}
+        total_in = int(u.get("input_tokens", 0) or 0)
+        total_out = int(u.get("output_tokens", 0) or 0)
+        cost = float(u.get("cost_usd", 0.0) or 0.0)
+        if simulator is not None:  # 用户模拟器用量并入任务总账
+            total_in += simulator.total_usage.input_tokens
+            total_out += simulator.total_usage.output_tokens
+            cost += simulator.total_usage.cost_usd
         recorder.trajectory.meta.total_usage = Usage(
-            input_tokens=int(u.get("input_tokens", 0) or 0),
-            output_tokens=int(u.get("output_tokens", 0) or 0),
-            cost_usd=float(u.get("cost_usd", 0.0) or 0.0),
+            input_tokens=total_in, output_tokens=total_out, cost_usd=cost
         )
         outcome = CaseOutcome(
             trajectory=recorder.trajectory,

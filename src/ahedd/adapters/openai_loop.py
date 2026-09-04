@@ -47,7 +47,10 @@ class OpenAILoopAdapter:
         task: TaskInput,
         tools: list[ToolDefinition],
         recorder: TrajectoryRecorder | None = None,
+        user_responder: Any = None,
     ) -> AgentResult:
+        """:param user_responder: 可选的用户模拟器回调（异步，输入 Agent 终答 -> 返回下一句用户话语；
+        返回含 ###STOP### 时结束）。提供时进入多轮对话模式（vita/tau2 系数据集）。"""
         messages: list[dict[str, Any]] = []
         if task.system_prompt or self.system_prompt:
             messages.append({"role": "system", "content": task.system_prompt or self.system_prompt})
@@ -81,23 +84,36 @@ class OpenAILoopAdapter:
             messages.append(_assistant_message(resp))
 
             if not resp.tool_calls:
+                final = resp.content or ""
+                usage_total = {
+                    "input_tokens": total.input_tokens,
+                    "output_tokens": total.output_tokens,
+                    "cost_usd": total.cost_usd,
+                }
                 if recorder:
                     recorder.note(
                         "assistant",
-                        content=resp.content or "",
+                        content=final,
                         reasoning=resp.reasoning_content,
                         stop_reason=resp.finish_reason,
                         usage=resp.usage,
                     )
-                return AgentResult(
-                    final_message=resp.content or "",
-                    stop_reason="stop" if resp.finish_reason == "stop" else resp.finish_reason,
-                    usage_total={
-                        "input_tokens": total.input_tokens,
-                        "output_tokens": total.output_tokens,
-                        "cost_usd": total.cost_usd,
-                    },
-                )
+                if user_responder is None:
+                    return AgentResult(
+                        final_message=final,
+                        stop_reason="stop" if resp.finish_reason == "stop" else resp.finish_reason,
+                        usage_total=usage_total,
+                    )
+                # 多轮对话：终答交给用户模拟器，取下一句用户话语继续（###STOP### 结束）
+                from ahedd.user.simulator import is_stop
+
+                user_reply = await user_responder(final)
+                if is_stop(user_reply):
+                    return AgentResult(final_message=final, stop_reason="stop", usage_total=usage_total)
+                messages.append({"role": "user", "content": user_reply})
+                if recorder:
+                    recorder.note("user", content=user_reply)
+                continue
 
             # 每次补全记一条 assistant 事件（可能无文本，携带思考链与本轮用量）
             if recorder:

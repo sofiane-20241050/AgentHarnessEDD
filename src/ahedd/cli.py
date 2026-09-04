@@ -56,6 +56,7 @@ def adapters_cmd() -> None:
     help="工具注入：text=协议桥兜底；mcp=原生 MCP（当前支持 claude-code）",
 )
 @click.option("--mcp-port", default=8023, show_default=True, help="MCP server 端口（tool-mode=mcp 时）")
+@click.option("--no-user-sim", is_flag=True, help="禁用用户模拟器（默认：配置了 AHEDD_USER_SIMULATOR_* 且任务带剧本时启用）")
 def run_cmd(
     dataset: str,
     domain: str | None,
@@ -68,6 +69,7 @@ def run_cmd(
     disable_thinking: bool,
     tool_mode: str,
     mcp_port: int,
+    no_user_sim: bool,
 ) -> None:
     """跑评测：采集轨迹 + 确定性断言（rubric 判分用 ahedd score 离线执行，先存后判）。"""
     import asyncio
@@ -188,8 +190,8 @@ def run_cmd(
 
             _ssh_target = os.environ.get("AHEDD_CC_SSH")
             if adapter == "claude-code" and _ssh_target:
-                # 远端拓扑：MCP server 与 CC 同机（dev01）。
-                # （tsh 不支持 ssh -R 反向转发，本地 server 无法暴露给 dev01）
+                # 远端拓扑：MCP server 与 CC 同机（同主机才能走 localhost）。
+                # （部分跳板方案不支持 ssh -R 反向转发，故远端自起 server 是通用做法）
                 _remote_python = os.environ.get("AHEDD_CC_PYTHON", "python")
                 _remote_events = "/tmp/ahedd_mcp_events.jsonl"
                 _mcp_events_file = _remote_events
@@ -230,6 +232,20 @@ def run_cmd(
                 _case_setup(None)
                 click.echo(f"# mcp server (local, per-case restart): port={mcp_port}")
 
+        def _sim_factory(case):
+            from ahedd.llm import make_client as _mc
+            from ahedd.user import UserSimulator
+
+            sim_kwargs: dict = {"max_tokens": 512}
+            if not think_sim:
+                sim_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            return UserSimulator(_mc(roles.user_simulator), case, chat_kwargs=sim_kwargs)
+
+        use_sim = roles.user_simulator is not None and not no_user_sim
+        if use_sim:
+            think_sim = not disable_thinking
+            click.echo(f"# user simulator: {roles.user_simulator.model}（多轮对话模式）")
+
         pairs = asyncio.run(
             run_dataset(
                 provider=get_dataset(dataset),
@@ -242,6 +258,7 @@ def run_cmd(
                 concurrency=1 if tool_mode == "mcp" else concurrency,  # per-case server 重启需串行
                 on_result=_print_result,
                 case_setup=_case_setup,
+                user_simulator_factory=_sim_factory if use_sim else None,
             )
         )
     finally:

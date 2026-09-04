@@ -1,11 +1,12 @@
 """Claude Code CLI 适配器（车道三：子进程 RPC，外部黑盒 Agent 第一个真实现）。
 
-链路（对齐 dev01 实测环境）::
+链路（远端模式）::
 
-    本适配器 ──tsh ssh──► dev01: claude -p --output-format json [--resume <sid>]
-                              │  cwd = tau2-bench（.claude/settings.local.json 生效）
-                              ▼
-                    anthropic_proxy(:8022) ──► vLLM(:8021, Qwen3.8-27B)
+    本适配器 ──ssh──► 远端主机: claude -p --output-format json [--resume <sid>]
+                          │  cwd = workdir（.claude/settings.local.json 生效，
+                          │  模型端点由用户自行配置，如 OpenAI/Anthropic 兼容代理）
+                          ▼
+                     claude 自行完成工具循环（MCP 模式下连接我们的环境 MCP server）
 
 工具桥（文本协议，借鉴 tau2-bench 的 ClaudeCodeAgent 方案）：环境工具不打进 CC 的
 MCP，而是在附加系统提示里给工具目录，约定 CC 需要域操作时输出 JSON 块::
@@ -74,7 +75,7 @@ class ClaudeCodeAdapter:
         events_file: str | None = None,
         events_ssh_target: str | None = None,
     ) -> None:
-        """:param ssh_target: 形如 "research@nm-zhipu-a800-develop01"；None 则本地子进程执行。
+        """:param ssh_target: 形如 "user@remote-host"（经 ssh 在远端执行 claude）；None 则本地子进程执行。
         :param workdir: claude 的工作目录（.claude/settings.local.json 生效范围）。
         :param node_bin: claude 所在的 nvm bin 目录（远端 PATH 注入）。
         :param tool_mode: "text" = 文本协议桥（兜底，任何 CLI 可用）；
