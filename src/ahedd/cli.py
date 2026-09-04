@@ -196,15 +196,23 @@ def run_cmd(
                 _remote_events = "/tmp/ahedd_mcp_events.jsonl"
                 _mcp_events_file = _remote_events
                 _mcp_events_ssh = _ssh_target
-                _cleanup_cmds.append(f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true")
+                _cleanup_cmds.append(f"pkill -f 'ahedd[.]mcp.*--port {mcp_port}' || true")
+
+                _domain_flag = f"--domain {domain} " if domain else ""
 
                 def _case_setup(case):
+                    # 杀进程与起进程必须分两次 ssh：合并成一条时，命令行里 nohup 部分的
+                    # "ahedd.mcp ... --port" 字面量会被 pkill -f 匹配到自身 shell 而整条自杀
                     subprocess.run(
                         ["tsh", "ssh", _ssh_target,
-                         (f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true; "
-                          f"rm -f {_remote_events} /tmp/ahedd_mcp.log; "
+                         f"pkill -f 'ahedd[.]mcp.*--port {mcp_port}' || true"],
+                        capture_output=True, timeout=30, check=False,
+                    )
+                    subprocess.run(
+                        ["tsh", "ssh", _ssh_target,
+                         (f"rm -f {_remote_events} /tmp/ahedd_mcp.log; "
                           f"nohup {_shlex.quote(_remote_python)} -m ahedd.mcp --dataset {dataset} "
-                          f"--http --port {mcp_port} --events-file {_remote_events} "
+                          f"{_domain_flag}--http --port {mcp_port} --events-file {_remote_events} "
                           f"--env-seed {getattr(case, 'env_seed', 0) or 0} "
                           ">/tmp/ahedd_mcp.log 2>&1 &")],
                         capture_output=True, timeout=60, check=False,

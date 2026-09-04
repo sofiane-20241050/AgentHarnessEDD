@@ -154,57 +154,123 @@ class ClaudeCodeAdapter:
         task: TaskInput,
         tools: list[ToolDefinition],
         recorder: TrajectoryRecorder | None = None,
+        user_responder: Any = None,
     ) -> AgentResult:
         if self.tool_mode == "mcp":
-            return await self._run_mcp(task, recorder)
-        return await self._run_text_protocol(task, tools, recorder)
+            return await self._run_mcp(task, recorder, user_responder)
+        return await self._run_text_protocol(task, tools, recorder, user_responder)
 
-    async def _run_mcp(self, task: TaskInput, recorder: TrajectoryRecorder | None) -> AgentResult:
-        """MCP 模式：CC 原生工具环路。一次 -p 调用内 CC 自行完成全部 MCP 工具调用，
-        工具执行发生在我们的 MCP server 进程（事件日志 -> 合并入统一轨迹 + 环境终态 diff）。"""
+    async def _run_mcp(
+        self,
+        task: TaskInput,
+        recorder: TrajectoryRecorder | None,
+        user_responder: Any = None,
+    ) -> AgentResult:
+        """MCP 模式：CC 原生工具环路。一轮 -p 内 CC 自行完成 MCP 工具调用；
+        多轮对话（用户模拟器）经 --resume 续轮。工具执行发生在 MCP server 进程，
+        事件按轮增量合并（保持与 assistant 消息的真实顺序）。"""
+        from ahedd.user.simulator import is_stop
+
         mcp_config = json.dumps(
             {"mcpServers": {self.mcp_server_name: {"type": "http", "url": self.mcp_url}}}
         )
-        flags = [
+        init_flags = [
             "--mcp-config", mcp_config,
             "--strict-mcp-config",
             # server 级授权：mcp__<server> 允许其全部工具（中间通配符 mcp__x_* 不受支持）
             "--allowedTools", f"mcp__{self.mcp_server_name}",
         ]
-        data = await asyncio.to_thread(self._call_claude, task.instruction, None, None, flags)
-
-        raw_usage = data.get("usage") or {}
-        usage = Usage(
-            input_tokens=int(raw_usage.get("input_tokens", 0) or 0),
-            output_tokens=int(raw_usage.get("output_tokens", 0) or 0),
-            cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
-        )
-        result_text = (data.get("result") or "").strip()
-
+        prompt = task.instruction
+        session_id: str | None = None
+        total = Usage()
+        final_text = ""
+        merged_events = 0
         env_diff: dict[str, Any] | None = None
-        if self.events_file and recorder:
-            from ahedd.mcp.server import read_server_events
 
-            events_path = self._fetch_events()
-            if events_path:
-                server_steps, initial_state, final_state = read_server_events(events_path)
-                for step in server_steps:  # 工具事件入轨（位于最终 assistant 之前）
-                    step.index = len(recorder.trajectory.steps)
-                    recorder.trajectory.steps.append(step)
-                if initial_state or final_state:
-                    env_diff = default_diff(initial_state, final_state)
-            recorder.note("assistant", content=result_text, stop_reason="stop", usage=usage)
+        for _dialog_turn in range(self.max_turns):
+            flags = init_flags if session_id is None else ["--resume", session_id]
+            data = await asyncio.to_thread(self._call_claude, prompt, None, None, flags)
+            session_id = data.get("session_id") or session_id
+
+            raw_usage = data.get("usage") or {}
+            usage = Usage(
+                input_tokens=int(raw_usage.get("input_tokens", 0) or 0),
+                output_tokens=int(raw_usage.get("output_tokens", 0) or 0),
+                cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
+            )
+            total = Usage(
+                input_tokens=total.input_tokens + usage.input_tokens,
+                output_tokens=total.output_tokens + usage.output_tokens,
+                cost_usd=total.cost_usd + usage.cost_usd,
+            )
+            result_text = (data.get("result") or "").strip()
+            final_text = result_text
+
+            # 本轮新增的 server 工具事件先入轨（发生于本轮终答之前），再记 assistant
+            if self.events_file:
+                merged_events = self._merge_new_events(recorder, merged_events)
+            if recorder:
+                recorder.note("assistant", content=result_text, usage=usage)
+
+            if user_responder is None:
+                break
+            user_reply = await user_responder(result_text)
+            if is_stop(user_reply):
+                break
+            if recorder:
+                recorder.note("user", content=user_reply)
+            prompt = user_reply
+        else:
+            if recorder:
+                recorder.note(
+                    "error", content="max dialog turns reached", stop_reason="max_steps", error_kind="agent"
+                )
+            return AgentResult(final_message="", stop_reason="max_steps", usage_total={
+                "input_tokens": total.input_tokens, "output_tokens": total.output_tokens, "cost_usd": total.cost_usd,
+            })
+
+        # 终态 diff：完整事件日志的首/末 env_state
+        if self.events_file:
+            diff = self._final_env_diff()
+            if diff is not None:
+                env_diff = diff
 
         return AgentResult(
-            final_message=result_text,
+            final_message=final_text,
             stop_reason="stop",
             usage_total={
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cost_usd": usage.cost_usd,
+                "input_tokens": total.input_tokens,
+                "output_tokens": total.output_tokens,
+                "cost_usd": total.cost_usd,
             },
             env_diff=env_diff,
         )
+
+    def _merge_new_events(self, recorder: Any, already_merged: int) -> Any:
+        """增量合并 server 事件（只追加 already_merged 之后的新步骤）。"""
+        from ahedd.mcp.server import read_server_events
+
+        events_path = self._fetch_events()
+        if not events_path:
+            return None
+        server_steps, _, _ = read_server_events(events_path)
+        for step in server_steps[already_merged:]:
+            if recorder is not None:
+                step.index = len(recorder.trajectory.steps)
+                recorder.trajectory.steps.append(step)
+            already_merged += 1
+        return already_merged
+
+    def _final_env_diff(self) -> dict[str, Any] | None:
+        from ahedd.mcp.server import read_server_events
+
+        events_path = self._fetch_events()
+        if not events_path:
+            return None
+        _, initial_state, final_state = read_server_events(events_path)
+        if initial_state or final_state:
+            return default_diff(initial_state, final_state)
+        return None
 
     def _fetch_events(self) -> str | None:
         """事件日志路径：本地直接用；远端经 tsh ssh cat 拉到临时文件。"""
@@ -228,6 +294,7 @@ class ClaudeCodeAdapter:
         task: TaskInput,
         tools: list[ToolDefinition],
         recorder: TrajectoryRecorder | None,
+        user_responder: Any = None,
     ) -> AgentResult:
         registry = ToolRegistry(tools)
         brief = _build_brief(registry, self.system_prompt)
@@ -260,15 +327,34 @@ class ClaudeCodeAdapter:
             call = _extract_tool_call(result_text)
             if call is None:
                 final_message = result_text
-                return AgentResult(
-                    final_message=final_message,
-                    stop_reason="stop",
-                    usage_total={
-                        "input_tokens": total.input_tokens,
-                        "output_tokens": total.output_tokens,
-                        "cost_usd": total.cost_usd,
-                    },
-                )
+                if user_responder is None:
+                    return AgentResult(
+                        final_message=final_message,
+                        stop_reason="stop",
+                        usage_total={
+                            "input_tokens": total.input_tokens,
+                            "output_tokens": total.output_tokens,
+                            "cost_usd": total.cost_usd,
+                        },
+                    )
+                # 多轮对话：终答交用户模拟器，--resume 续轮（###STOP### 结束）
+                from ahedd.user.simulator import is_stop
+
+                user_reply = await user_responder(result_text)
+                if is_stop(user_reply):
+                    return AgentResult(
+                        final_message=final_message,
+                        stop_reason="stop",
+                        usage_total={
+                            "input_tokens": total.input_tokens,
+                            "output_tokens": total.output_tokens,
+                            "cost_usd": total.cost_usd,
+                        },
+                    )
+                if recorder:
+                    recorder.note("user", content=user_reply)
+                text = user_reply
+                continue
 
             name, args = call
             tool = registry.get(name)
