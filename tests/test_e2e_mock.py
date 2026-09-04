@@ -74,7 +74,7 @@ async def test_e2e_change_address(tmp_path: Path, provider) -> None:
     # 确定性断言通过
     assert check_trajectory_rules(case, outcome.trajectory) == []
     # 轨迹落盘可读回（先存轨迹后判分的前提）
-    trace_file = tmp_path / "mock" / case.id / f"{outcome.trajectory.meta.run_id}.jsonl"
+    trace_file = tmp_path / "mock" / "mock" / case.id / f"{outcome.trajectory.meta.run_id}.jsonl"
     reloaded = load_jsonl_trajectory(str(trace_file))
     assert len(reloaded.steps) == len(outcome.trajectory.steps)
 

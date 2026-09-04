@@ -317,7 +317,7 @@ def run_cmd(
 
 
 @main.command("score")
-@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹目录")
+@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹根目录（结构：runs/<数据集>/<域>/<case>/<run_id>.jsonl）")
 @click.option("--dataset", default="mock", show_default=True, help="用于取 TaskCase/rubrics 的数据集")
 @click.option("--models", "models_yaml", default=None, help="models.yaml 路径（缺省用 .env/环境变量）")
 @click.option("--no-judge", is_flag=True, help="只算确定性指标，跳过 LLM 判分")
@@ -460,7 +460,7 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
 
 
 @main.command("report")
-@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹目录")
+@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹根目录（结构：runs/<数据集>/<域>/<case>/<run_id>.jsonl）")
 @click.option("--out", default="report.html", show_default=True)
 def report_cmd(runs_dir: str, out: str) -> None:
     """生成单文件 HTML 诊断报告（轨迹回放 + rubric 判分 + 环境 diff）。"""

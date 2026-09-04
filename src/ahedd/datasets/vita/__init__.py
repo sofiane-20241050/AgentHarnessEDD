@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from ahedd.datasets import register_dataset
@@ -104,7 +103,7 @@ class VitaEnvironment:
         在专用线程执行：VitaBench 的 StoreProduct 使用线程本地存储注册实例，
         reset 和工具调用必须在同一线程，否则 get_all_products() 找不到商品。
         """
-        import asyncio
+        import asyncio as _a
 
         def _do_reset():
             with _force_utf8_open():
@@ -117,7 +116,6 @@ class VitaEnvironment:
                 self._env = _build_env(self.domain, db, self.language)
                 self._active_index = index
 
-        import asyncio as _a
 
         await _a.get_event_loop().run_in_executor(None, lambda: self._run_in_env_thread(_do_reset))
 
@@ -146,7 +144,7 @@ def _wrap_tool(vita_env: Any, tool: Any, _env_executor: Any = None) -> ToolDefin
             with _force_utf8_open():
                 return vita_env.use_tool(tool_name=tool.name, **kwargs)
 
-        return await asyncio.get_event_loop().run_in_executor(
+        return await __import__("asyncio").get_event_loop().run_in_executor(
             _env_executor, _run
         )
 

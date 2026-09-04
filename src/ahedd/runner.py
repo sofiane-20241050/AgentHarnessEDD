@@ -183,7 +183,7 @@ async def run_case(
     if outcome.env_diff is None:
         outcome.env_diff = env.diff(before, env.snapshot())
     final_state = adapter_final_state or env.snapshot()
-    path = f"{trace_dir}/{env.domain}/{task_id}/{meta.run_id}.jsonl"
+    path = f"{trace_dir}/{dataset}/{env.domain}/{task_id}/{meta.run_id}.jsonl"
     recorder.dump_jsonl(path)
     # 旁车持久化：终态 diff（报告消费） + 终态全量快照（确定性终态断言消费）
     import json as _json
