@@ -30,10 +30,12 @@ import os
 import re
 import shlex
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ahedd.adapters import register_adapter
 from ahedd.adapters.base import AgentResult, TaskInput
+from ahedd.env.base import default_diff
 from ahedd.env.tools import ToolDefinition, ToolRegistry
 from ahedd.trace.schema import Usage
 
@@ -66,10 +68,21 @@ class ClaudeCodeAdapter:
         timeout: int = 300,
         max_turns: int = 20,
         system_prompt: str | None = None,
+        tool_mode: str = "text",
+        mcp_server_name: str = "ahedd",
+        mcp_url: str = "http://127.0.0.1:8023/mcp",
+        events_file: str | None = None,
+        events_ssh_target: str | None = None,
     ) -> None:
         """:param ssh_target: 形如 "research@nm-zhipu-a800-develop01"；None 则本地子进程执行。
         :param workdir: claude 的工作目录（.claude/settings.local.json 生效范围）。
         :param node_bin: claude 所在的 nvm bin 目录（远端 PATH 注入）。
+        :param tool_mode: "text" = 文本协议桥（兜底，任何 CLI 可用）；
+            "mcp" = 原生工具调用：经 --mcp-config 连接我们的环境 MCP server（推荐，测真实 CC 工作方式）。
+        :param mcp_url / mcp_server_name / events_file: MCP 模式参数（events_file 为 server 事件日志，
+            适配器读回合并进统一轨迹并提供环境终态 diff）。
+        :param events_ssh_target: 事件日志在远端（MCP server 与 CC 同机运行）时，
+            经 tsh ssh cat 拉取；None 则读本地文件。
         """
         self.workdir = workdir
         self.ssh_target = ssh_target
@@ -77,10 +90,22 @@ class ClaudeCodeAdapter:
         self.timeout = timeout
         self.max_turns = max_turns
         self.system_prompt = system_prompt
+        self.tool_mode = tool_mode
+        self.mcp_server_name = mcp_server_name
+        self.mcp_url = mcp_url
+        self.events_file = events_file
+        self.events_ssh_target = events_ssh_target
 
     # ---- 子进程执行（阻塞，由 run 内 to_thread 包装） ----
 
-    def _call_claude(self, prompt: str, session_id: str | None, append_system: str | None) -> dict[str, Any]:
+    def _call_claude(
+        self,
+        prompt: str,
+        session_id: str | None,
+        append_system: str | None,
+        extra_flags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        flags = list(extra_flags or [])
         if self.ssh_target:
             script = (
                 f"export PATH={self.node_bin}:$PATH && cd {shlex.quote(self.workdir)} "
@@ -91,6 +116,7 @@ class ClaudeCodeAdapter:
             if append_system:
                 b64 = base64.b64encode(append_system.encode("utf-8")).decode()
                 script += f' --append-system-prompt "$(echo {b64} | base64 -d)"'
+            script += "".join(f" {shlex.quote(f)}" for f in flags)
             cmd: list[str] = ["tsh", "ssh", self.ssh_target, script]
             env = None
         else:
@@ -99,6 +125,7 @@ class ClaudeCodeAdapter:
                 cmd += ["--resume", session_id]
             if append_system:
                 cmd += ["--append-system-prompt", append_system]
+            cmd += flags
             env = dict(os.environ)
             env["PATH"] = os.path.expanduser(self.node_bin) + os.pathsep + env.get("PATH", "")
 
@@ -126,6 +153,80 @@ class ClaudeCodeAdapter:
         task: TaskInput,
         tools: list[ToolDefinition],
         recorder: TrajectoryRecorder | None = None,
+    ) -> AgentResult:
+        if self.tool_mode == "mcp":
+            return await self._run_mcp(task, recorder)
+        return await self._run_text_protocol(task, tools, recorder)
+
+    async def _run_mcp(self, task: TaskInput, recorder: TrajectoryRecorder | None) -> AgentResult:
+        """MCP 模式：CC 原生工具环路。一次 -p 调用内 CC 自行完成全部 MCP 工具调用，
+        工具执行发生在我们的 MCP server 进程（事件日志 -> 合并入统一轨迹 + 环境终态 diff）。"""
+        mcp_config = json.dumps(
+            {"mcpServers": {self.mcp_server_name: {"type": "http", "url": self.mcp_url}}}
+        )
+        flags = [
+            "--mcp-config", mcp_config,
+            "--strict-mcp-config",
+            # server 级授权：mcp__<server> 允许其全部工具（中间通配符 mcp__x_* 不受支持）
+            "--allowedTools", f"mcp__{self.mcp_server_name}",
+        ]
+        data = await asyncio.to_thread(self._call_claude, task.instruction, None, None, flags)
+
+        raw_usage = data.get("usage") or {}
+        usage = Usage(
+            input_tokens=int(raw_usage.get("input_tokens", 0) or 0),
+            output_tokens=int(raw_usage.get("output_tokens", 0) or 0),
+            cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
+        )
+        result_text = (data.get("result") or "").strip()
+
+        env_diff: dict[str, Any] | None = None
+        if self.events_file and recorder:
+            from ahedd.mcp.server import read_server_events
+
+            events_path = self._fetch_events()
+            if events_path:
+                server_steps, initial_state, final_state = read_server_events(events_path)
+                for step in server_steps:  # 工具事件入轨（位于最终 assistant 之前）
+                    step.index = len(recorder.trajectory.steps)
+                    recorder.trajectory.steps.append(step)
+                if initial_state or final_state:
+                    env_diff = default_diff(initial_state, final_state)
+            recorder.note("assistant", content=result_text, stop_reason="stop", usage=usage)
+
+        return AgentResult(
+            final_message=result_text,
+            stop_reason="stop",
+            usage_total={
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cost_usd": usage.cost_usd,
+            },
+            env_diff=env_diff,
+        )
+
+    def _fetch_events(self) -> str | None:
+        """事件日志路径：本地直接用；远端经 tsh ssh cat 拉到临时文件。"""
+        if not self.events_ssh_target:
+            return self.events_file
+        import tempfile
+
+        proc = subprocess.run(
+            ["tsh", "ssh", self.events_ssh_target, f"cat {shlex.quote(self.events_file)}"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        tmp_path = Path(tempfile.gettempdir()) / f"ahedd_events_{os.getpid()}.jsonl"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(proc.stdout)
+        return str(tmp_path)
+
+    async def _run_text_protocol(
+        self,
+        task: TaskInput,
+        tools: list[ToolDefinition],
+        recorder: TrajectoryRecorder | None,
     ) -> AgentResult:
         registry = ToolRegistry(tools)
         brief = _build_brief(registry, self.system_prompt)

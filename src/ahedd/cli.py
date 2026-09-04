@@ -48,6 +48,11 @@ def adapters_cmd() -> None:
 @click.option("--concurrency", default=1, show_default=True, help="并发上限（信号量；环境按任务隔离，可安全并发）")
 @click.option("--max-tokens", default=4096, show_default=True, help="单次补全最大 token")
 @click.option("--disable-thinking", is_flag=True, help="vLLM: extra_body enable_thinking=False（Qwen3 系思考模型提速）")
+@click.option(
+    "--tool-mode", "tool_mode", type=click.Choice(["text", "mcp"]), default="text", show_default=True,
+    help="工具注入：text=协议桥兜底；mcp=原生 MCP（当前支持 claude-code）",
+)
+@click.option("--mcp-port", default=8023, show_default=True, help="MCP server 端口（tool-mode=mcp 时）")
 def run_cmd(
     dataset: str,
     domain: str | None,
@@ -58,6 +63,8 @@ def run_cmd(
     concurrency: int,
     max_tokens: int,
     disable_thinking: bool,
+    tool_mode: str,
+    mcp_port: int,
 ) -> None:
     """跑评测：采集轨迹 + 确定性断言（rubric 判分用 ahedd score 离线执行，先存后判）。"""
     import asyncio
@@ -102,6 +109,10 @@ def run_cmd(
                 workdir=os.environ.get("AHEDD_CC_DIR", "."),
                 ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
                 node_bin=os.environ.get("AHEDD_CC_NODE_BIN", "~/.nvm/versions/node/v22.22.0/bin"),
+                tool_mode=tool_mode,
+                mcp_url=f"http://127.0.0.1:{mcp_port}/mcp",
+                events_file=_mcp_events_file,
+                events_ssh_target=_mcp_events_ssh,
             )
         raise click.UsageError(f"未知 adapter: {adapter!r}（见 ahedd adapters list）")
 
@@ -124,19 +135,90 @@ def run_cmd(
         if outcome.env_diff:
             click.echo(f"        env_diff: {_json.dumps(outcome.env_diff, ensure_ascii=False, default=str)[:200]}")
 
-    pairs = asyncio.run(
-        run_dataset(
-            provider=get_dataset(dataset),
-            adapter_factory=factory,
-            domain=domain,
-            case_ids=case_ids.split(",") if case_ids else None,
-            trials=trials,
-            dataset=dataset,
-            agent_model=roles.agent.model,
-            concurrency=concurrency,
-            on_result=_print_result,
+    if tool_mode == "mcp" and adapter != "claude-code":
+        raise click.UsageError("--tool-mode mcp 当前仅支持 claude-code 车道")
+
+    _mcp_events_file: str | None = None
+    _mcp_events_ssh: str | None = None
+    _cleanup_procs: list = []
+    _cleanup_cmds: list[str] = []
+    try:
+        if tool_mode == "mcp":
+            import shlex as _shlex
+            import socket
+            import subprocess
+            import sys
+            import time as _time
+            from pathlib import Path
+
+            _ssh_target = os.environ.get("AHEDD_CC_SSH")
+            if adapter == "claude-code" and _ssh_target:
+                # 远端拓扑：MCP server 与 CC 同机（dev01）。
+                # （tsh 不支持 ssh -R 反向转发，本地 server 无法暴露给 dev01）
+                remote_python = os.environ.get("AHEDD_CC_PYTHON", "python")
+                remote_events = "/tmp/ahedd_mcp_events.jsonl"
+                subprocess.run(
+                    ["tsh", "ssh", _ssh_target,
+                     (f"rm -f {remote_events}; nohup {_shlex.quote(remote_python)} -m ahedd.mcp "
+                      f"--dataset {dataset} --http --port {mcp_port} --events-file {remote_events} "
+                      ">/tmp/ahedd_mcp.log 2>&1 &")],
+                    capture_output=True, timeout=60, check=False,
+                )
+                ready = subprocess.run(
+                    ["tsh", "ssh", _ssh_target,
+                     f"for i in $(seq 1 40); do ss -tln | grep -q ':{mcp_port} ' && exit 0; sleep 0.5; done; exit 1"],
+                    capture_output=True, timeout=90, check=False,
+                )
+                if ready.returncode != 0:
+                    subprocess.run(["tsh", "ssh", _ssh_target, "cat /tmp/ahedd_mcp.log"], check=False)
+                    raise click.ClickException(
+                        "远端 MCP server 未就绪：请确认 dev01 已安装本包（pip install 'agentharness-edd[mcp]'）"
+                        "且 AHEDD_CC_PYTHON 指向正确解释器"
+                    )
+                _mcp_events_file = remote_events
+                _mcp_events_ssh = _ssh_target
+                _cleanup_cmds.append(f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true")
+                click.echo(f"# mcp server (remote): {_ssh_target}:{mcp_port} events={remote_events}")
+            else:
+                _mcp_events_file = str(Path("runs") / "mcp_events.jsonl")
+                Path(_mcp_events_file).parent.mkdir(parents=True, exist_ok=True)
+                Path(_mcp_events_file).unlink(missing_ok=True)  # 每次运行重写事件日志
+                click.echo(f"# mcp server (local): port={mcp_port} events={_mcp_events_file}")
+                server_proc = subprocess.Popen(
+                    [sys.executable, "-m", "ahedd.mcp", "--dataset", dataset,
+                     "--http", "--port", str(mcp_port), "--events-file", _mcp_events_file]
+                )
+                _cleanup_procs.append(server_proc)
+                for _ in range(60):  # 等端口就绪
+                    try:
+                        socket.create_connection(("127.0.0.1", mcp_port), timeout=1).close()
+                        break
+                    except OSError:
+                        _time.sleep(0.5)
+                else:
+                    raise click.ClickException(f"MCP server 未能在端口 {mcp_port} 就绪")
+            click.echo("# 注意：MCP server 共享单环境实例，多 case/多 trial 会互相污染（按 case 重启待后续）")
+
+        pairs = asyncio.run(
+            run_dataset(
+                provider=get_dataset(dataset),
+                adapter_factory=factory,
+                domain=domain,
+                case_ids=case_ids.split(",") if case_ids else None,
+                trials=trials,
+                dataset=dataset,
+                agent_model=roles.agent.model,
+                concurrency=concurrency,
+                on_result=_print_result,
+            )
         )
-    )
+    finally:
+        for proc in _cleanup_procs:
+            proc.terminate()
+        for cmd in _cleanup_cmds:
+            ssh = os.environ.get("AHEDD_CC_SSH")
+            if ssh:
+                subprocess.run(["tsh", "ssh", ssh, cmd], capture_output=True, timeout=60, check=False)
 
     n_pass = sum(
         1
@@ -184,7 +266,13 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
 
     suite_rows: list[tuple[str, str, bool | None, object]] = []
     for trace_file in traces:
-        trajectory = load_jsonl_trajectory(str(trace_file))
+        try:
+            trajectory = load_jsonl_trajectory(str(trace_file))
+            if not trajectory.meta.task_id:
+                raise ValueError("not a trajectory file")
+        except Exception:  # noqa: BLE001 - 跳过非轨迹 JSONL（如 MCP server 事件日志）
+            click.echo(f"[SKIP] {trace_file.name}: 非轨迹文件")
+            continue
         meta = trajectory.meta
         case = next(
             (c for c in provider.load(meta.domain) if c.id == meta.task_id), None
@@ -238,6 +326,32 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
 def report_cmd(run_id: str) -> None:
     """生成单文件 HTML 诊断报告。"""
     click.echo("脚手架阶段：ahedd report 于 D4 里程碑实现。")
+
+
+@main.group("mcp")
+def mcp_cmd() -> None:
+    """MCP server 工具集：把数据集环境暴露给 MCP 客户端被测对象。"""
+
+
+@mcp_cmd.command("serve")
+@click.option("--dataset", default="mock", show_default=True)
+@click.option("--domain", default=None)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8023, show_default=True)
+@click.option("--stdio", is_flag=True, help="stdio 传输（默认 streamable-http）")
+@click.option("--events-file", default=None, help="工具/环境事件日志（JSONL）")
+def mcp_serve_cmd(dataset: str, domain: str | None, host: str, port: int, stdio: bool, events_file: str | None) -> None:
+    """运行环境的 MCP server（阻塞；Ctrl-C 退出）。"""
+    from ahedd.mcp.server import run_server
+
+    run_server(
+        dataset,
+        domain=domain,
+        transport="stdio" if stdio else "streamable-http",
+        host=host,
+        port=port,
+        events_path=events_file,
+    )
 
 
 @main.command("freeze")

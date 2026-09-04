@@ -31,6 +31,9 @@ class AgentResult:
     final_message: str
     stop_reason: str = "stop"  # stop | max_steps | error
     usage_total: dict[str, float] = field(default_factory=dict)
+    # 工具不在 runner 侧执行时（如 MCP 车道：执行发生在 MCP server 进程），
+    # 由适配器提供环境终态 diff；None 则 runner 用本地 env 计算。
+    env_diff: dict[str, Any] | None = None
 
 
 @runtime_checkable

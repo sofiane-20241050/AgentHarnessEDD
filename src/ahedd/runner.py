@@ -114,6 +114,7 @@ async def run_case(
             trajectory=recorder.trajectory,
             final_message=result.final_message,
             stop_reason=result.stop_reason,
+            env_diff=result.env_diff,  # MCP 等外置执行车道由适配器提供；None 则下方本地计算
         )
     except Exception as exc:  # noqa: BLE001 - 失败也是评测结果，必须入轨
         from ahedd.trace.errors import classify_exception
@@ -135,7 +136,8 @@ async def run_case(
             error=f"{type(exc).__name__}: {exc}",
         )
 
-    outcome.env_diff = env.diff(before, env.snapshot())
+    if outcome.env_diff is None:
+        outcome.env_diff = env.diff(before, env.snapshot())
     path = f"{trace_dir}/{env.domain}/{task_id}/{meta.run_id}.jsonl"
     recorder.dump_jsonl(path)
     return outcome
