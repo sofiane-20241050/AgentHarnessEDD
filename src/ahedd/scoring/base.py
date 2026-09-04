@@ -31,7 +31,8 @@ class ScoreReport(BaseModel):
     passed: bool = False
     score: float = 0.0                        # 全有或全无：全部 rubric 满足 = 1.0
     rubric_results: list[RubricResult] = Field(default_factory=list)
-    rule_violations: list[str] = Field(default_factory=list)  # 确定性通道违例
+    rule_violations: list[str] = Field(default_factory=list)  # 轨迹规则违例（确定性）
+    state_violations: list[str] = Field(default_factory=list)  # 终态断言违例（确定性，增强通道）
     judge_meta: dict[str, str] = Field(default_factory=dict)  # 判分模型/窗口参数等
 
 

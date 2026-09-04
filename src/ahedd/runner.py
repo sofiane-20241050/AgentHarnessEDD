@@ -136,6 +136,7 @@ async def run_case(
     tools = [recorder.wrap_tool(t) for t in env.tools()]
     task = TaskInput(task_id=task_id, instruction=instruction, system_prompt=system_prompt)
 
+    adapter_final_state: dict[str, Any] | None = None
     try:
         run_kwargs = {}
         if simulator is not None:
@@ -152,11 +153,12 @@ async def run_case(
         recorder.trajectory.meta.total_usage = Usage(
             input_tokens=total_in, output_tokens=total_out, cost_usd=cost
         )
+        adapter_final_state = result.final_state  # MCP 等外置执行车道的终态快照
         outcome = CaseOutcome(
             trajectory=recorder.trajectory,
             final_message=result.final_message,
             stop_reason=result.stop_reason,
-            env_diff=result.env_diff,  # MCP 等外置执行车道由适配器提供；None 则下方本地计算
+            env_diff=result.env_diff,  # None 则下方本地计算
         )
     except Exception as exc:  # noqa: BLE001 - 失败也是评测结果，必须入轨
         from ahedd.trace.errors import classify_exception
@@ -180,13 +182,17 @@ async def run_case(
 
     if outcome.env_diff is None:
         outcome.env_diff = env.diff(before, env.snapshot())
+    final_state = adapter_final_state or env.snapshot()
     path = f"{trace_dir}/{env.domain}/{task_id}/{meta.run_id}.jsonl"
     recorder.dump_jsonl(path)
-    # 环境终态 diff 旁车持久化（报告/回归冻结消费）
+    # 旁车持久化：终态 diff（报告消费） + 终态全量快照（确定性终态断言消费）
     import json as _json
     from pathlib import Path as _P
 
     _P(path).with_suffix(".envdiff.json").write_text(
         _json.dumps(outcome.env_diff, ensure_ascii=False, default=str), encoding="utf-8"
+    )
+    _P(path).with_suffix(".envstate.json").write_text(
+        _json.dumps(final_state, ensure_ascii=False, default=str), encoding="utf-8"
     )
     return outcome

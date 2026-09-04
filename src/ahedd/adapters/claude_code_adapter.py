@@ -316,9 +316,10 @@ class ClaudeCodeAdapter:
                 "input_tokens": total.input_tokens, "output_tokens": total.output_tokens, "cost_usd": total.cost_usd,
             })
 
-        # 终态 diff：完整事件日志的首/末 env_state
+        # 终态 diff 与终态快照：完整事件日志的首/末 env_state
+        final_state: dict[str, Any] | None = None
         if self.events_file:
-            diff = self._final_env_diff()
+            diff, final_state = self._final_env_state()
             if diff is not None:
                 env_diff = diff
 
@@ -331,6 +332,7 @@ class ClaudeCodeAdapter:
                 "cost_usd": total.cost_usd,
             },
             env_diff=env_diff,
+            final_state=final_state,
         )
 
     def _merge_new_events(self, recorder: Any, already_merged: int) -> Any:
@@ -348,16 +350,17 @@ class ClaudeCodeAdapter:
             already_merged += 1
         return already_merged
 
-    def _final_env_diff(self) -> dict[str, Any] | None:
+    def _final_env_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """返回 (终态 diff, 终态全量快照)。"""
         from ahedd.mcp.server import read_server_events
 
         events_path = self._fetch_events()
         if not events_path:
-            return None
+            return None, None
         _, initial_state, final_state = read_server_events(events_path)
-        if initial_state or final_state:
-            return default_diff(initial_state, final_state)
-        return None
+        if not (initial_state or final_state):
+            return None, None
+        return default_diff(initial_state, final_state), (final_state or None)
 
     def _fetch_events(self) -> str | None:
         """事件日志路径：本地直接用；远端经 tsh ssh cat 拉到临时文件。"""

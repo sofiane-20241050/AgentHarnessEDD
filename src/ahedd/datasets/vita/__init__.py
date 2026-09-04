@@ -244,7 +244,10 @@ class VitaProvider:
                     rubrics=rubrics,
                     env_seed=index,  # 任务索引 -> 环境初始态
                     source="vitabench",
-                    extra={"evaluation_criteria": ec} if ec else {},
+                    extra={
+                        **({"evaluation_criteria": ec} if ec else {}),
+                        "env_time": str(_task_db(task).get("time") or ""),
+                    },
                 )
             )
         return cases

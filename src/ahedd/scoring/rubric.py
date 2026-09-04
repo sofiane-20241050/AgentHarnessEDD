@@ -29,10 +29,18 @@ _JUDGE_SYSTEM = """你是 Agent 评测判分器。给你一段 Agent 交互轨�
 - 已标记 satisfied=true 的项保持 true（永久满足，不因后续窗口撤销）
 - 只依据窗口内可观察的证据判定（助手发言、工具调用名称与参数、工具返回）
 - 工具返回是环境的真实反馈，优先于助手的口头声称
+- 订单类 rubric（涉及必须生成订单的细节）必须确认助手真实完成了下单操作：
+  助手自以为下单成功但工具调用实际失败、或用户表示"可以自己下单"等情形，均视为不满足
 - evidence_turn 填该断言被满足/违反时所在的回合号（本窗口内），无法定位填 null
 输出严格 JSON，不要输出任何其他文字。"""
 
-_JUDGE_USER_TMPL = """<rubrics>
+_JUDGE_USER_TMPL = """# 任务（用户原始诉求，仅供理解语境，判定仍以窗口证据为准）
+{instruction}
+
+# 环境时间
+{system_time}
+
+<rubrics>
 {rubrics_json}
 </rubrics>
 <window>
@@ -43,6 +51,8 @@ _JUDGE_USER_TMPL = """<rubrics>
 请输出 JSON：
 {{"results": [{{"key": "r0", "satisfied": true, "evidence_turn": 3, "rationale": "一句话依据"}}, ...]}}
 每个 rubric 一项，key 与输入一致。"""
+
+
 
 
 class RubricSlidingWindowScorer:
@@ -76,8 +86,15 @@ class RubricSlidingWindowScorer:
             "overlap_turns": str(self.overlap_turns),
         }
 
+        env_time = ""
+        extra = getattr(case, "extra", None) or {}
+        if isinstance(extra, dict):
+            env_time = str(extra.get("env_time") or "")
         for window_index, (steps, turn_start, turn_end) in enumerate(self._windows(trajectory.steps)):
-            prompt = self._build_prompt(states, steps, window_index, turn_start, turn_end)
+            prompt = self._build_prompt(
+                states, steps, window_index, turn_start, turn_end,
+                instruction=getattr(case, "instruction", ""), system_time=env_time,
+            )
             resp = await self.judge.chat(
                 [{"role": "system", "content": _JUDGE_SYSTEM}, {"role": "user", "content": prompt}],
                 **self.chat_kwargs,
@@ -154,6 +171,8 @@ class RubricSlidingWindowScorer:
         window_index: int,
         turn_start: int,
         turn_end: int,
+        instruction: str = "",
+        system_time: str = "",
     ) -> str:
         rubrics_json = json.dumps(
             [
@@ -164,6 +183,8 @@ class RubricSlidingWindowScorer:
             indent=1,
         )
         return _JUDGE_USER_TMPL.format(
+            instruction=instruction[:500] or "(未提供)",
+            system_time=system_time or "(未知)",
             rubrics_json=rubrics_json,
             window_index=window_index,
             turn_start=turn_start,

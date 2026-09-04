@@ -331,7 +331,12 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
     from ahedd.config import load_models_config
     from ahedd.datasets import get_dataset
     from ahedd.llm import make_client
-    from ahedd.scoring import RubricSlidingWindowScorer, compute_trajectory_metrics, summarize_suite
+    from ahedd.scoring import (
+        RubricSlidingWindowScorer,
+        check_expected_states,
+        compute_trajectory_metrics,
+        summarize_suite,
+    )
     from ahedd.trace.schema import load_jsonl_trajectory
 
     provider = get_dataset(dataset)
@@ -370,8 +375,23 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
         passed: bool | None = None
         score_value = None
         rubric_detail: list = []
+        state_violations: list = []
         if scorer is not None and case.rubrics:
             report = asyncio.run(scorer.score(case, trajectory))
+            # 终态断言（增强通道）：终态快照旁车 + expected_states 确定性比对
+            state_file = trace_file.with_suffix(".envstate.json")
+            ec = (getattr(case, "extra", None) or {}).get("evaluation_criteria") or {}
+            expected = ec.get("expected_states") if isinstance(ec, dict) else None
+            if state_file.exists() and expected:
+                import json as _j2
+
+                try:
+                    final_state = _j2.loads(state_file.read_text(encoding="utf-8"))
+                    state_violations = check_expected_states(expected, final_state)
+                except Exception:  # noqa: BLE001 - 断言失败不阻断判分
+                    state_violations = []
+            report.state_violations = state_violations
+            report.passed = report.passed and not state_violations
             passed = report.passed
             score_value = report.score
             rubric_detail = [r.model_dump() for r in report.rubric_results]
@@ -384,6 +404,7 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
             f"rubric={rubric_str} score={score_value if score_value is not None else '-'} "
             f"turns={metrics.turns} useful={metrics.useful_action_ratio} "
             f"errs={metrics.error_events} tokens={metrics.tokens_in}/{metrics.tokens_out}"
+            + (f" state_violations={len(state_violations)}" if state_violations else "")
         )
         suite_rows.append((meta.adapter, meta.task_id, passed, metrics))
 
@@ -395,6 +416,7 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
                     "passed": passed,
                     "score": score_value,
                     "rubric_results": rubric_detail,
+                    "state_violations": state_violations,
                     "metrics": metrics.model_dump(),
                 },
                 ensure_ascii=False,

@@ -58,3 +58,31 @@ def count_repeated_failures(steps: list[StepRecord]) -> int:
             current = 0
         longest = max(longest, current)
     return longest
+
+
+def check_expected_states(expected_states: list[dict], final_state: dict) -> list[str]:
+    """确定性终态断言（增强通道，VitaBench 官方未实现——其 evaluator 不消费 final_state）。
+
+    对 TaskCase.extra.evaluation_criteria.expected_states 的 required_orders 做字段级比对：
+    只断言 expected 中给出的字段（宽松字段匹配），orders 表里必须存在逐字段相等的订单。
+    所有 expected_state 的 required_orders 取 AND。
+    """
+    violations: list[str] = []
+    final_orders = {str(o.get("order_id") or o.get("id")): o for o in (final_state.get("orders") or {}).values()}         if isinstance(final_state.get("orders"), dict) else {str(o.get("order_id") or o.get("id")): o
+                                                              for o in (final_state.get("orders") or [])}
+    for si, state in enumerate(expected_states or []):
+        for required in state.get("required_orders") or []:
+            oid = str(required.get("order_id") or required.get("id") or "")
+            actual = final_orders.get(oid)
+            if actual is None:
+                violations.append(f"expected_state[{si}]: required order {oid} not found in final DB")
+                continue
+            for field, expected_value in required.items():
+                if field in {"order_id", "id"}:
+                    continue
+                if str(actual.get(field)) != str(expected_value):
+                    violations.append(
+                        f"expected_state[{si}]: order {oid} field '{field}' "
+                        f"expected={expected_value!r} actual={actual.get(field)!r}"
+                    )
+    return violations
