@@ -1,131 +1,82 @@
 #!/usr/bin/env python3
-"""端到端实战脚本：Claude Code CLI × VitaBench（MCP 原生工具 + 用户模拟器 + 判分 + 报告）。
+"""端到端实战：Claude Code CLI × VitaBench（MCP 原生工具 + 用户模拟器 + 判分 + 报告）。
 
-用法（在本目录下）::
+用法（解释器随意——脚本自动优先使用项目 .venv，避免误用系统 Python 踩依赖/编码坑）::
 
     python run_experiment.py --cases 10711002
     python run_experiment.py --cases 10711002,10711003 --skip-report
 
-前置条件见同目录 README.md（模型端点 / claude CLI / vitabench 安装 / .env 配置）。
+前置条件见同目录 README.md。脚本按序调用框架 CLI（与手动执行完全等价、编排单源维护）：
+run（含 MCP server 自动拉起/按 case 重启）→ score → report。
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-# 允许直接从 examples 目录运行：把仓库根加进 sys.path（框架以 -e 安装时可省）
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT / "src"))
-
-from ahedd.adapters.claude_code_adapter import ClaudeCodeAdapter
-from ahedd.config import load_dotenv, load_models_config
-from ahedd.datasets import get_dataset
-from ahedd.llm import make_client
-from ahedd.report.html import render_report
-from ahedd.runner import run_dataset
-from ahedd.scoring import RubricSlidingWindowScorer, compute_trajectory_metrics
-from ahedd.user import UserSimulator
-
-MCP_PORT = 8023
+SRC = ROOT / "src"
 
 
-def parse_args() -> argparse.Namespace:
+def pick_python() -> str:
+    """优先项目 .venv 解释器（依赖齐全、编码可控），缺省回退当前解释器。"""
+    for candidate in (ROOT / ".venv" / "Scripts" / "python.exe", ROOT / ".venv" / "bin" / "python"):
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
+def run_step(title: str, cli_args: list[str], env: dict) -> int:
+    print(f"{title}: ahedd {' '.join(cli_args)}", flush=True)
+    proc = subprocess.run(
+        [env["__PYTHON__"], "-m", "ahedd.cli", *cli_args],
+        cwd=str(ROOT), env={k: v for k, v in env.items() if k != "__PYTHON__"}, check=False,
+    )
+    if proc.returncode != 0:
+        print(f"    (exit {proc.returncode})")
+    return proc.returncode
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Claude Code CLI × VitaBench 端到端实验")
     parser.add_argument("--cases", required=True, help="逗号分隔的 case id，如 10711002")
     parser.add_argument("--domain", default="delivery", help="vita 域（默认 delivery）")
-    parser.add_argument("--mcp-port", type=int, default=MCP_PORT)
+    parser.add_argument("--adapter", default="claude-code", help="被测车道（默认 claude-code）")
     parser.add_argument("--skip-report", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--no-user-sim", action="store_true", help="禁用用户模拟器")
+    args = parser.parse_args()
 
+    python = pick_python()
+    print(f"[解释器] {python}")
 
-async def main() -> None:
-    args = parse_args()
+    if SRC.exists():  # 允许未安装（-e）时从源码运行
+        sys.path.insert(0, str(SRC))
+    from ahedd.config import load_dotenv
+
     load_dotenv(ROOT / ".env")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUTF8"] = "1"
+    env["__PYTHON__"] = python
 
-    roles = load_models_config()
-    print(f"[1/4] 被测模型: {roles.agent.model} | 判分器: {roles.judge.model if roles.judge else '(未配)'}")
+    common = ["--dataset", "vita", "--domain", args.domain]
+    runs_dir = f"runs/{args.domain}"
 
-    provider = get_dataset("vita")
-    cases = [c for c in provider.load(args.domain) if c.id in set(args.cases.split(","))]
-    print(f"[1/4] vita/{args.domain}: 命中 {len(cases)} 个任务 {[c.id for c in cases]}")
-
-    # ② 驱动 Claude Code（MCP 原生工具模式；环境 MCP server 由 CLI/外部负责拉起，
-    #    本脚本聚焦流程演示，也可改用 `ahedd run --tool-mode mcp` 全自动编排）
-    def adapter_factory() -> ClaudeCodeAdapter:
-        return ClaudeCodeAdapter(
-            workdir=os.environ.get("AHEDD_CC_DIR", "."),
-            ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
-            node_bin=os.environ.get("AHEDD_CC_NODE_BIN", "~/.nvm/versions/node/v22.22.0/bin"),
-            tool_mode="mcp",
-            mcp_url=f"http://127.0.0.1:{args.mcp_port}/mcp",
-            events_file=os.environ.get("AHEDD_CC_EVENTS", "/tmp/ahedd_mcp_events.jsonl"),
-            events_ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
-        )
-
-    def sim_factory(case):
-        if roles.user_simulator is None:
-            return None
-        return UserSimulator(
-            make_client(roles.user_simulator), case,
-            chat_kwargs={"max_tokens": 512, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-        )
-
-    print("[2/4] 跑评测（MCP 原生工具 + 用户模拟器多轮）… 先确保 MCP server 在跑：")
-    print(f"        ahedd mcp serve --dataset vita --domain {args.domain} --port {args.mcp_port} "
-          f"--events-file ${{AHEDD_CC_EVENTS:-/tmp/ahedd_mcp_events.jsonl}}")
-    pairs = await run_dataset(
-        provider=provider,
-        adapter_factory=adapter_factory,
-        domain=args.domain,
-        case_ids=args.cases.split(","),
-        dataset="vita",
-        agent_model=roles.agent.model,
-        user_simulator_factory=sim_factory if roles.user_simulator else None,
-    )
-
-    # ③ 判分 + 过程指标
-    print("[3/4] 离线判分…")
-    judge = None
-    if roles.judge is not None:
-        judge = RubricSlidingWindowScorer(
-            make_client(roles.judge),
-            chat_kwargs={"max_tokens": 2048, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-        )
-    rows = []
-    for case, outcome in pairs:
-        passed = None
-        rubric_n = (0, 0)
-        if judge is not None:
-            report = await judge.score(case, outcome.trajectory)
-            passed = report.passed
-            rubric_n = (sum(r.satisfied for r in report.rubric_results), len(report.rubric_results))
-            (Path("runs") / outcome.trajectory.meta.domain / case.id / f"{outcome.trajectory.meta.run_id}.score.json").write_text(
-                report.model_dump_json(indent=1), encoding="utf-8"
-            )
-        metrics = compute_trajectory_metrics(outcome.trajectory)
-        status = "----" if passed is None else ("PASS" if passed else "FAIL")
-        print(f"    [{status}] {case.id} rubric={rubric_n[0]}/{rubric_n[1]} "
-              f"turns={metrics.turns} tokens={metrics.tokens_in}/{metrics.tokens_out}")
-        rows.append((case, outcome, passed))
-
-    # ④ 报告
+    run_step("[1/3] 跑评测（自动拉起 MCP server + 用户模拟器多轮）",
+             ["run", *common, "--adapter", args.adapter, "--tool-mode", "mcp",
+              "--cases", args.cases, *(["--no-user-sim"] if args.no_user_sim else [])], env)
+    run_step("[2/3] 离线判分（rubric 滑窗 judge + 过程指标）",
+             ["score", "--runs", runs_dir, "--dataset", "vita"], env)
     if not args.skip_report:
-        print("[4/4] 渲染 HTML 报告…")
-        items = [{
-            "meta": o.trajectory.meta.model_dump(),
-            "steps": [s.model_dump(exclude_none=True) for s in o.trajectory.steps],
-            "score": None, "env_diff": o.env_diff,
-        } for _, o, _ in rows]
-        out = render_report(items, "vita_report.html")
-        print(f"    report -> {out}")
+        run_step("[3/3] HTML 诊断报告",
+                 ["report", "--runs", runs_dir, "--out", "vita_report.html"], env)
 
-    print("\n完成。冻结失败轨迹：ahedd freeze <run_id> --attribution <归因标签>")
+    print("\n产物：runs/（轨迹+判分+diff）、vita_report.html；失败轨迹冻结：ahedd freeze <run_id>")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

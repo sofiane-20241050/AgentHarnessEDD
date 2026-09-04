@@ -133,6 +133,7 @@ class ClaudeCodeAdapter:
         try:
             proc = subprocess.run(
                 cmd, input=prompt, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",  # claude 输出为 UTF-8，勿随解释器 locale（Windows 中文区为 GBK）
                 timeout=self.timeout, env=env, check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -280,7 +281,8 @@ class ClaudeCodeAdapter:
 
         proc = subprocess.run(
             ["tsh", "ssh", self.events_ssh_target, f"cat {shlex.quote(self.events_file)}"],
-            capture_output=True, text=True, timeout=60, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, check=False,
         )
         if proc.returncode != 0:
             return None

@@ -83,6 +83,13 @@ def run_cmd(
     from ahedd.scoring.deterministic import check_trajectory_rules
 
     roles = load_models_config(models_yaml)
+    # MCP URL：AHEDD_MCP_URL 完整覆盖（端口从 URL 解析），否则由 --mcp-port 构造
+    import os as _os
+    from urllib.parse import urlsplit
+
+    _mcp_url = _os.environ.get("AHEDD_MCP_URL") or f"http://127.0.0.1:{mcp_port}/mcp"
+    if _os.environ.get("AHEDD_MCP_URL"):
+        mcp_port = urlsplit(_mcp_url).port or mcp_port
     click.echo(
         f"# dataset={dataset} adapter={adapter} model={roles.agent.model} "
         f"trials={trials} concurrency={concurrency}"
@@ -106,7 +113,7 @@ def run_cmd(
                 agent_spec,
                 disable_thinking=disable_thinking,
                 tool_mode=tool_mode,
-                mcp_url=f"http://127.0.0.1:{mcp_port}/mcp",
+                mcp_url=_mcp_url,
                 events_file=_mcp_events_file,
             )
         if adapter == "tau":
@@ -121,7 +128,7 @@ def run_cmd(
                 ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
                 node_bin=os.environ.get("AHEDD_CC_NODE_BIN", "~/.nvm/versions/node/v22.22.0/bin"),
                 tool_mode=tool_mode,
-                mcp_url=f"http://127.0.0.1:{mcp_port}/mcp",
+                mcp_url=_mcp_url,
                 events_file=_mcp_events_file,
                 events_ssh_target=_mcp_events_ssh,
             )
