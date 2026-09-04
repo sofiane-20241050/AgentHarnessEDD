@@ -67,13 +67,27 @@ _DOMAINS = ("delivery", "instore", "ota", "cross_domain")
 
 
 class VitaEnvironment:
-    """包装 vita 的 Environment：工具全集注册；reset(seed=i) 重建第 i 个任务的初始 DB。"""
+    """包装 vita 的 Environment：工具全集注册；reset(seed=i) 重建第 i 个任务的初始 DB。
+
+    所有 vita 环境操作在专用线程执行：VitaBench 使用线程本地存储管理
+    StoreProduct 等实例注册表，跨线程调用 get_all_products() 会得到空结果。
+    """
 
     def __init__(self, domain: str, language: str = "zh") -> None:
         self.domain = domain
         self.language = language
         self._tasks: list[Any] = _load_vita_tasks(domain, language)
         self._env: Any = None
+        self._env_thread: Any = None
+
+    def _run_in_env_thread(self, func: Any) -> Any:
+        """在专用线程同步执行（保证线程本地注册表一致）。"""
+        import concurrent.futures
+
+        if self._env_thread is None:
+            self._env_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = self._env_thread.submit(func)
+        return future.result(timeout=120)
 
     # ---- Environment 契约 ----
 
@@ -81,17 +95,31 @@ class VitaEnvironment:
         self._ensure_env()
         defs = []
         for tool in self._env.get_tools():
-            defs.append(_wrap_tool(self._env, tool))
+            defs.append(_wrap_tool(self._env, tool, self._env_thread))
         return defs
 
     async def reset(self, seed: int | None = None) -> None:
-        """seed = 任务索引：重建该任务的初始 DB（工具随 DB 重建）。"""
-        index = int(seed or 0)
-        if not 0 <= index < len(self._tasks):
-            raise ValueError(f"env_seed={seed} 超出 {self.domain} 任务范围 [0, {len(self._tasks)})")
-        db = _task_db(self._tasks[index])
-        self._env = _build_env(self.domain, db, self.language)
-        self._active_index = index
+        """seed = 任务索引：重建该任务的初始 DB（工具随 DB 重建）。
+
+        在专用线程执行：VitaBench 的 StoreProduct 使用线程本地存储注册实例，
+        reset 和工具调用必须在同一线程，否则 get_all_products() 找不到商品。
+        """
+        import asyncio
+
+        def _do_reset():
+            with _force_utf8_open():
+                index = int(seed or 0)
+                if not 0 <= index < len(self._tasks):
+                    raise ValueError(
+                        f"env_seed={seed} 超出 {self.domain} 任务范围 [0, {len(self._tasks)})"
+                    )
+                db = _task_db(self._tasks[index])
+                self._env = _build_env(self.domain, db, self.language)
+                self._active_index = index
+
+        import asyncio as _a
+
+        await _a.get_event_loop().run_in_executor(None, lambda: self._run_in_env_thread(_do_reset))
 
     def snapshot(self) -> dict[str, Any]:
         self._ensure_env()
@@ -109,7 +137,7 @@ class VitaEnvironment:
             raise RuntimeError("环境未 reset：请先调用 reset(seed=任务索引)")
 
 
-def _wrap_tool(vita_env: Any, tool: Any) -> ToolDefinition:
+def _wrap_tool(vita_env: Any, tool: Any, _env_executor: Any = None) -> ToolDefinition:
     schema = tool.params.model_json_schema() if tool.params else {"type": "object", "properties": {}}
     schema.pop("title", None)
 
@@ -118,7 +146,9 @@ def _wrap_tool(vita_env: Any, tool: Any) -> ToolDefinition:
             with _force_utf8_open():
                 return vita_env.use_tool(tool_name=tool.name, **kwargs)
 
-        return await asyncio.to_thread(_run)
+        return await asyncio.get_event_loop().run_in_executor(
+            _env_executor, _run
+        )
 
     return ToolDefinition(
         name=tool.name,
