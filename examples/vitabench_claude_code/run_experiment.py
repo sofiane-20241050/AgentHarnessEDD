@@ -64,7 +64,7 @@ def main() -> None:
     env["__PYTHON__"] = python
 
     common = ["--dataset", "vita", "--domain", args.domain]
-    runs_dir = f"runs/{args.domain}"
+    runs_dir = f"runs/vita/{args.domain}"
 
     run_step("[1/3] 跑评测（自动拉起 MCP server + 用户模拟器多轮）",
              ["run", *common, "--adapter", args.adapter, "--tool-mode", "mcp",

@@ -120,7 +120,7 @@ ahedd mcp serve --dataset mock --port 8023 --events-file events.jsonl [--stdio]
 ahedd run --dataset vita --domain delivery --cases 10711001
 
 # ② 判分 → 得知哪些 rubric 未满足、有无违例
-ahedd score --runs runs/delivery --dataset vita
+ahedd score --runs runs/vita/delivery --dataset vita
 
 # ③ 诊断 → 打开 HTML 报告看失败发生在哪一步
 ahedd report --runs runs/delivery
@@ -132,7 +132,7 @@ ahedd freeze <run_id> --attribution tool.loop
 
 # ⑥ 复验 → 重跑全量回归，确认修好了且没引入新问题
 ahedd run --dataset mock --cases <之前冻结的所有case_id>
-ahedd score --runs runs/mock --dataset mock
+ahedd score --runs runs/mock/mock --dataset mock
 ```
 
 **沉淀公式**：经验 = 通过回归门禁的那次 diff + 归因统计的下降曲线。

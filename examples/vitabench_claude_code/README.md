@@ -72,10 +72,10 @@ ahedd run --dataset vita --domain delivery --adapter claude-code \
     --tool-mode mcp --cases 10711002
 
 # ② 离线判分（rubric 滑窗 judge + 轨迹动力学指标）
-ahedd score --runs runs/delivery --dataset vita
+ahedd score --runs runs/vita/delivery --dataset vita
 
 # ③ HTML 诊断报告（轨迹回放 / rubric 红绿 / 环境终态 diff）
-ahedd report --runs runs/delivery --out vita_report.html
+ahedd report --runs runs/vita/delivery --out vita_report.html
 
 # ④（可选）失败轨迹冻结为回归用例
 ahedd freeze <run_id> --attribution tool.loop
@@ -85,7 +85,7 @@ ahedd freeze <run_id> --attribution tool.loop
 
 ```bash
 ahedd run --dataset vita --domain delivery --adapter openai-loop --disable-thinking --cases 10711002
-ahedd score --runs runs/delivery --dataset vita
+ahedd score --runs runs/vita/delivery --dataset vita
 ```
 
 `ahedd score` 末尾的套件汇总会给出两个车道的 pass_rate 与 token 消耗对比——
