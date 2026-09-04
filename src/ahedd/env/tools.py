@@ -26,6 +26,43 @@ class ToolDefinition:
     func: Callable[..., Awaitable[Any]]
 
 
+_JSON_TYPES: dict[str, type] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+class _ArgsBase:
+    """fastmcp FuncMetadata 需要的逐层 dump 方法（见 ahedd.mcp.server）。"""
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in type(self).model_fields}  # type: ignore[attr-defined]
+
+
+def schema_to_args_model(tool_name: str, schema: dict[str, Any], *, bases: tuple[type, ...] | None = None) -> type:
+    """JSON Schema -> pydantic args 模型（LangChain StructuredTool / MCP FuncMetadata 共用）。
+
+    :param bases: 基类元组；缺省 (BaseModel, _ArgsBase)。MCP 侧需传 fastmcp 的 ArgModelBase。
+    """
+    from pydantic import BaseModel, Field, create_model
+
+    properties: dict[str, Any] = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    fields: dict[str, Any] = {}
+    for field_name, field_def in properties.items():
+        py_type = _JSON_TYPES.get(field_def.get("type", "string"), str)
+        if field_name in required:
+            fields[field_name] = (py_type, Field(..., description=field_def.get("description", "")))
+        else:
+            fields[field_name] = (py_type | None, Field(None, description=field_def.get("description", "")))
+    base_classes = bases if bases is not None else (BaseModel, _ArgsBase)
+    return create_model(f"{tool_name}_args", __base__=base_classes, **fields)
+
+
 class ToolRegistry:
     """工具集的只读视图：按名查找、迭代、OpenAI 格式转换。"""
 
@@ -36,7 +73,7 @@ class ToolRegistry:
             raise ValueError("duplicate tool names in registry")
 
     @classmethod
-    def from_list(cls, tools: list[ToolDefinition]) -> "ToolRegistry":
+    def from_list(cls, tools: list[ToolDefinition]) -> ToolRegistry:
         return cls(tools)
 
     def get(self, name: str) -> ToolDefinition | None:
