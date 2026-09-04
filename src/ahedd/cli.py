@@ -603,6 +603,108 @@ def _triage(t: Any, metrics: Any) -> str:
     return "reasoning.constraint"
 
 
+@main.command("distill")
+@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹根目录")
+@click.option("--out", default="LESSONS.md", show_default=True, help="输出经验文件")
+@click.option("--models", "models_yaml", default=None)
+def distill_cmd(runs_dir: str, out: str, models_yaml: str | None) -> None:
+    """从全部轨迹蒸馏经验：失败模式 -> 可注入的规则/教训（LESSONS.md）。
+
+    产物直接可注入被测 Agent 的 system prompt（Hermes Agent 的 MEMORY.md 同位），
+    区别在于：每条教训绑定 RC 回归用例，修复后可通过 ahedd ci 验证。
+    """
+    import asyncio
+    import json as _json
+    from pathlib import Path
+
+    from ahedd.config import load_models_config
+    from ahedd.llm import make_client
+    from ahedd.scoring import compute_trajectory_metrics
+
+    traces = [f for f in sorted(Path(runs_dir).rglob("*.jsonl"))
+              if not f.name.endswith((".score.json", ".envdiff.json", ".envstate.json"))]
+    if not traces:
+        click.echo(f"{runs_dir} 下没有轨迹")
+        return
+
+    roles = load_models_config(models_yaml)
+    if roles.judge is None:
+        click.echo("判分器未配置（AHEDD_JUDGE_*），distill 需要 LLM 分析")
+        return
+
+    click.echo(f"# distill: {len(traces)} 条轨迹 → 经验蒸馏")
+
+    # 收集全部轨迹摘要
+    summaries = []
+    for tf in traces:
+        try:
+            from ahedd.trace.schema import load_jsonl_trajectory
+
+            t = load_jsonl_trajectory(str(tf))
+            score_data = {}
+            score_f = tf.with_suffix(".score.json")
+            if score_f.exists():
+                score_data = _json.loads(score_f.read_text(encoding="utf-8"))
+            m = compute_trajectory_metrics(t)
+            failed_rubrics = [r.get("description", "") for r in score_data.get("rubric_results", [])
+                              if not r.get("satisfied")]
+            summaries.append({
+                "task": t.meta.task_id,
+                "adapter": t.meta.adapter,
+                "passed": score_data.get("passed"),
+                "stop_reason": next((s.stop_reason for s in reversed(t.steps) if s.stop_reason), ""),
+                "failed_rubrics": failed_rubrics[:3],
+                "agent_errors": m.agent_errors,
+                "tool_calls": m.tool_calls,
+                "useful_ratio": m.useful_action_ratio,
+                "max_streak": m.max_failure_streak,
+            })
+        except Exception:  # noqa: BLE001, S112 - 跳过损坏轨迹
+            continue
+
+    # 用 judge 模型蒸馏
+
+    judge = make_client(roles.judge)
+    prompt = f"""你是 Agent 评测分析师。以下是 {len(summaries)} 条轨迹的摘要（含成功与失败）。
+请蒸馏出可操作的"教训"（每个教训 = 一条具体的、可注入 system prompt 的规则），格式如下：
+
+## 失败模式教训
+- **[归因标签]** 教训内容（具体到工具名/参数名/行为描述）
+...
+
+## 成功模式（可提取为 few-shot）
+- 场景描述 -> 高效路径（步数/工具序列）
+...
+
+## 工具描述改进建议
+- 工具名：当前问题 -> 建议的描述修改
+...
+
+轨迹摘要：
+{_json.dumps(summaries, ensure_ascii=False, indent=1)[:8000]}
+"""
+    resp = asyncio.run(judge.chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    ))
+    lessons = resp.content or ""
+
+    # 写文件
+    import datetime as _dt
+
+    header = (
+        "# LESSONS.md - Agent 经验蒸馏\n\n"
+        f"> 生成时间：{_dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')}\n"
+        f"> 来源：{len(summaries)} 条轨迹 | "
+        f"通过率：{sum(1 for x in summaries if x['passed'])}/{len(summaries)}\n"
+        "> 验证方式：注入 system prompt 后重跑 `ahedd ci` 确认回归全绿\n\n"
+    )
+    out_path = Path(out)
+    out_path.write_text(header + lessons + "\n", encoding="utf-8")
+    click.echo(f"distilled -> {out_path} ({len(lessons)} chars)")
+
+
 @main.group("mcp")
 def mcp_cmd() -> None:
     """MCP server 工具集：把数据集环境暴露给 MCP 客户端被测对象。"""
@@ -630,9 +732,126 @@ def mcp_serve_cmd(dataset: str, domain: str | None, host: str, port: int, stdio:
 
 
 @main.command("ci")
-def ci_cmd() -> None:
-    """回归门禁：全量回归用例红绿检查。"""
-    click.echo("脚手架阶段：ahedd ci 于 D4 里程碑实现。")
+@click.option("--models", "models_yaml", default=None, help="models.yaml 路径")
+@click.option("--adapter", default="openai-loop", show_default=True)
+@click.option("--max-cases", default=0, help="最多跑多少条回归用例（0=全量）")
+def ci_cmd(models_yaml: str | None, adapter: str, max_cases: int) -> None:
+    """回归门禁：全量回归用例红绿检查（修复后必须全绿才算通过）。
+
+    读取 regressions/cases/RC-*.yaml，逐条重跑（同 env_seed + rubric + rules），
+    判分后输出红绿。任何一条红 → exit 1（CI 阻断）。
+    """
+    import asyncio
+    from pathlib import Path
+
+    from ahedd.config import load_models_config
+    from ahedd.llm import make_client
+    from ahedd.runner import run_case
+    from ahedd.scoring import RubricSlidingWindowScorer, check_trajectory_rules
+
+    cases_dir = Path("regressions/cases")
+    rc_files = sorted(cases_dir.glob("RC-*.yaml"))
+    if not rc_files:
+        click.echo("regressions/cases/ 下没有回归用例（先用 ahedd freeze 冻结）")
+        return
+    if max_cases > 0:
+        rc_files = rc_files[:max_cases]
+
+    import yaml as _yaml
+
+    roles = load_models_config(models_yaml)
+    click.echo(f"# CI 回归门禁：{len(rc_files)} 条用例 | adapter={adapter} | model={roles.agent.model}")
+
+    # 构建适配器
+    def factory():
+        if adapter == "openai-loop":
+            from ahedd.adapters.openai_loop import OpenAILoopAdapter
+
+            return OpenAILoopAdapter(make_client(roles.agent), chat_kwargs={"max_tokens": 4096})
+        if adapter == "claude-code":
+            from ahedd.adapters.claude_code_adapter import ClaudeCodeAdapter
+
+            return ClaudeCodeAdapter(
+                workdir=Path("regressions").resolve(),
+                ssh_target=None,
+                timeout=600,
+            )
+        from ahedd.adapters.openai_loop import OpenAILoopAdapter
+
+        return OpenAILoopAdapter(make_client(roles.agent))
+
+    # 判分器
+    scorer = None
+    if roles.judge:
+        scorer = RubricSlidingWindowScorer(
+            make_client(roles.judge),
+            chat_kwargs={"max_tokens": 2048,
+                          "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
+
+
+    all_pass = True
+    for rc_file in rc_files:
+        rc = _yaml.safe_load(rc_file.read_text(encoding="utf-8"))
+        rc_id = rc["id"]
+        dataset_name = rc.get("dataset", "mock")
+        domain = rc.get("domain", "mock")
+
+        # 从数据集找回原 case（rubrics/rules/seed）
+        from ahedd.datasets import get_dataset
+
+        try:
+            provider = get_dataset(dataset_name)
+            original = next(
+                (c for c in provider.load(domain) if c.id == rc.get("source_case_id", rc.get("source_run", ""))),
+                None,
+            )
+            if original is None:
+                # freeze 时没存 source_case_id，用 env_seed 索引找回
+                original = provider.load(domain)[rc.get("env_seed", 0)]
+        except Exception:  # noqa: BLE001 - 找不到原始任务时跳过该回归用例
+            click.echo(f"[SKIP] {rc_id}: 找不到原始任务定义")
+            continue
+
+        env = provider.build_environment(domain)
+        outcome = asyncio.run(run_case(
+            dataset=dataset_name,
+            adapter=factory(),
+            env=env,
+            case=original,
+            task_id=original.id,
+            instruction=original.instruction,
+            env_seed=original.env_seed,
+            trace_dir="runs/ci",
+            agent_model=roles.agent.model,
+        ))
+
+        # 判分
+        passed = False
+        detail = ""
+        violations = check_trajectory_rules(original, outcome.trajectory)
+        if scorer and original.rubrics:
+            report = asyncio.run(scorer.score(original, outcome.trajectory))
+            passed = report.passed and not violations
+            sat = sum(r.satisfied for r in report.rubric_results)
+            detail = f"rubric={sat}/{len(report.rubric_results)}"
+        else:
+            passed = outcome.stop_reason == "stop" and not violations
+
+        status = "✅ PASS" if passed else "❌ FAIL"
+        attribution = rc.get("attribution", {}).get("primary", "?") if isinstance(rc.get("attribution"), dict) else "?"
+        click.echo(f"  {status} {rc_id} [{attribution}] {detail} stop={outcome.stop_reason}")
+        if not passed:
+            all_pass = False
+            if outcome.error:
+                click.echo(f"       error: {outcome.error[:100]}")
+
+    click.echo()
+    if all_pass:
+        click.echo(f"✅ 回归门禁通过（{len(rc_files)}/{len(rc_files)} 全绿）")
+    else:
+        click.echo("❌ 回归门禁未通过（存在红项，修复后重跑）")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
