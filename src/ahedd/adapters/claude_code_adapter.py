@@ -269,10 +269,12 @@ class ClaudeCodeAdapter:
         merged_events = 0
         env_diff: dict[str, Any] | None = None
 
-        for _dialog_turn in range(self.max_turns):
+        for dialog_turn in range(self.max_turns):
             flags = init_flags if session_id is None else ["--resume", session_id]
+            # 首轮附带数据集的域提示（如 VitaBench 官方模板）；resume 轮由会话记忆携带
+            append = task.system_prompt if (session_id is None and task.system_prompt) else None
             data = await asyncio.to_thread(
-                self._call_claude, prompt, None, None, flags, self.on_event
+                self._call_claude, prompt, None, append, flags, self.on_event
             )
             session_id = data.get("session_id") or session_id
 
@@ -382,7 +384,8 @@ class ClaudeCodeAdapter:
         user_responder: Any = None,
     ) -> AgentResult:
         registry = ToolRegistry(tools)
-        brief = _build_brief(registry, self.system_prompt)
+        policy = "；".join(x for x in (task.system_prompt, self.system_prompt) if x) or None
+        brief = _build_brief(registry, policy)
 
         session_id: str | None = None
         text = task.instruction

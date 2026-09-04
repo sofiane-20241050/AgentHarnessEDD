@@ -67,6 +67,15 @@ async def run_dataset(
                 if maybe_await is not None and hasattr(maybe_await, "__await__"):
                     await maybe_await
             env = provider.build_environment(domain)
+            # 数据集自带的 Agent 系统提示（如 VitaBench 官方模板，任务级时间注入）：
+            # 多轮（有用户模拟器）用交互版模板，单发用 solo 版
+            system_prompt = None
+            sp_fn = getattr(provider, "agent_system_prompt", None)
+            if callable(sp_fn):
+                try:
+                    system_prompt = sp_fn(case, solo=user_simulator_factory is None)
+                except Exception:  # noqa: BLE001 - 提示组装失败退回适配器默认
+                    system_prompt = None
             outcome = await run_case(
                 dataset=dataset or provider.name,
                 adapter=adapter_factory(),
@@ -74,6 +83,7 @@ async def run_dataset(
                 case=case,
                 task_id=case.id,
                 instruction=case.instruction,
+                system_prompt=system_prompt,
                 env_seed=case.env_seed,
                 trace_dir=trace_dir,
                 agent_model=agent_model,
@@ -109,7 +119,8 @@ async def run_case(
     模拟器用量并入 total_usage。未提供时为单轮指令直跑。
     """
     meta = RunMeta(
-        task_id=task_id, domain=env.domain, dataset=dataset, adapter=adapter.name, agent_model=agent_model
+        task_id=task_id, domain=env.domain, dataset=dataset, adapter=adapter.name,
+        agent_model=agent_model, system_prompt=system_prompt,
     )
     recorder = TrajectoryRecorder(meta)
 

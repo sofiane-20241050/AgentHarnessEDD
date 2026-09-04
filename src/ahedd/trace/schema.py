@@ -57,6 +57,7 @@ class RunMeta(BaseModel):
     dataset: str = ""
     adapter: str = ""
     agent_model: str = ""
+    system_prompt: str | None = None  # 数据集自带 Agent 提示（如 VitaBench 官方模板）
     started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     total_usage: Usage = Field(default_factory=Usage)
 

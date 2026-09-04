@@ -191,13 +191,41 @@ class VitaProvider:
 
     def __init__(self, language: str = "zh") -> None:
         self.language = language
+        self._task_cache: dict[str, dict[str, Any]] = {}  # case_id -> task（组装任务级 system prompt 用）
 
     def domains(self) -> list[str]:
         return list(_DOMAINS)
 
+    def agent_system_prompt(self, case: TaskCase, *, solo: bool = False) -> str:
+        """VitaBench 官方 Agent 系统提示：模板.format(time=任务时间+星期)。
+
+        多轮（用户模拟器）用 agent_system_prompt（含对话规范与 ###STOP### 约定），
+        单发直跑用 solo_agent_system_prompt（一次性完成、不与用户交互）。
+        """
+        from vita.prompts import get_prompts
+        from vita.utils.utils import get_weekday
+
+        task = self._task_cache.get(case.id)
+        time_str = str(_as_dict(task).get("environment", {}).get("time") or "") if task else ""
+        if task is not None:
+            time_str = str(_task_db(task).get("time") or "")
+        lang = _LANGUAGES.get(self.language, None)
+        prompts = get_prompts()
+        template = prompts.solo_agent_system_prompt if solo else prompts.agent_system_prompt
+        text = template if isinstance(template, str) else str(getattr(template, "chinese", "") or template)
+        if lang == "en":
+            text = str(getattr(template, "english", "") or text)
+        if time_str:
+            try:
+                return text.format(time=f"{time_str} {get_weekday(time_str, self.language)}")
+            except Exception:  # noqa: BLE001 - 模板占位符不匹配时退回原文
+                return text
+        return text
+
     def load(self, domain: str) -> list[TaskCase]:
         cases = []
         for index, task in enumerate(_load_vita_tasks(domain, self.language)):
+            self._task_cache[str(task.id)] = task
             ec = _as_dict(task.evaluation_criteria)
             rubrics: list[str] = []
             for state in ec.get("expected_states", []):
