@@ -35,7 +35,7 @@ async def test_e2e_text_protocol_bridge(tmp_path, monkeypatch) -> None:
         return script[len(calls) - 1]
 
     monkeypatch.setattr(ClaudeCodeAdapter, "_call_claude", fake_call)
-    adapter = ClaudeCodeAdapter(workdir="/tmp/x", ssh_target=None)
+    adapter = ClaudeCodeAdapter(workdir="/tmp/x", ssh_target=None, tool_mode="text")
     env = provider.build_environment("mock")
 
     outcome = await run_case(

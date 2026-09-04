@@ -74,7 +74,7 @@ class ClaudeCodeAdapter:
         timeout: int = 900,
         max_turns: int = 20,
         system_prompt: str | None = None,
-        tool_mode: str = "text",
+        tool_mode: str = "mcp",  # 官方接入方式（code.claude.com/docs: 自定义工具走 MCP）
         mcp_server_name: str = "ahedd",
         mcp_url: str = "http://127.0.0.1:8023/mcp",
         events_file: str | None = None,
@@ -87,8 +87,9 @@ class ClaudeCodeAdapter:
         """:param ssh_target: 形如 "user@remote-host"（经 ssh 在远端执行 claude）；None 则本地子进程执行。
         :param workdir: claude 的工作目录（.claude/settings.local.json 生效范围）。
         :param node_bin: claude 所在的 nvm bin 目录（远端 PATH 注入）。
-        :param tool_mode: "text" = 文本协议桥（兜底，任何 CLI 可用）；
-            "mcp" = 原生工具调用：经 --mcp-config 连接我们的环境 MCP server（推荐，测真实 CC 工作方式）。
+        :param tool_mode: "mcp" = 原生工具调用（默认，CC 官方自定义工具唯一通道，测真实工作方式）；
+            "text" = JSON 块协议桥兜底（远端无法部署 MCP server 时用；与原生工具调用范式相悖，
+            分数不可与官方口径比较，且不注入数据集自带的官方系统提示——那类提示均假设原生工具调用）。
         :param mcp_url / mcp_server_name / events_file: MCP 模式参数（events_file 为 server 事件日志，
             适配器读回合并进统一轨迹并提供环境终态 diff）。
         :param events_ssh_target: 事件日志在远端（MCP server 与 CC 同机运行）时，
@@ -384,8 +385,9 @@ class ClaudeCodeAdapter:
         user_responder: Any = None,
     ) -> AgentResult:
         registry = ToolRegistry(tools)
-        policy = "；".join(x for x in (task.system_prompt, self.system_prompt) if x) or None
-        brief = _build_brief(registry, policy)
+        # 注意：text 模式不注入 task.system_prompt（数据集官方提示假设原生工具调用，
+        # 与"输出 JSON 块"协议矛盾）；仅用适配器自身的附加说明
+        brief = _build_brief(registry, self.system_prompt)
 
         session_id: str | None = None
         text = task.instruction
