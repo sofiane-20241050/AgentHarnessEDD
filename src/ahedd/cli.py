@@ -11,6 +11,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import click
 
 
@@ -97,7 +100,13 @@ def run_cmd(
         if adapter == "deepagents":
             from ahedd.adapters.deepagents_adapter import DeepAgentsAdapter
 
-            return DeepAgentsAdapter(agent_spec, disable_thinking=disable_thinking)
+            return DeepAgentsAdapter(
+                agent_spec,
+                disable_thinking=disable_thinking,
+                tool_mode=tool_mode,
+                mcp_url=f"http://127.0.0.1:{mcp_port}/mcp",
+                events_file=_mcp_events_file,
+            )
         if adapter == "tau":
             from ahedd.adapters.tau_adapter import TauAdapter
 
@@ -135,69 +144,91 @@ def run_cmd(
         if outcome.env_diff:
             click.echo(f"        env_diff: {_json.dumps(outcome.env_diff, ensure_ascii=False, default=str)[:200]}")
 
-    if tool_mode == "mcp" and adapter != "claude-code":
-        raise click.UsageError("--tool-mode mcp 当前仅支持 claude-code 车道")
+    if tool_mode == "mcp" and adapter not in ("claude-code", "deepagents"):
+        raise click.UsageError("--tool-mode mcp 当前支持 claude-code 与 deepagents 车道")
 
     _mcp_events_file: str | None = None
     _mcp_events_ssh: str | None = None
     _cleanup_procs: list = []
     _cleanup_cmds: list[str] = []
+    _case_setup = None
+
+    def _wait_local_port(port: int) -> None:
+        import socket
+        import time as _time
+
+        for _ in range(60):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                return
+            except OSError:
+                _time.sleep(0.5)
+        raise click.ClickException(f"MCP server 未能在端口 {port} 就绪")
+
+    def _wait_remote_ready(target: str, port: int) -> None:
+        import subprocess
+
+        ready = subprocess.run(
+            ["tsh", "ssh", target,
+             f"for i in $(seq 1 40); do ss -tln | grep -q ':{port} ' && exit 0; sleep 0.5; done; exit 1"],
+            capture_output=True, timeout=90, check=False,
+        )
+        if ready.returncode != 0:
+            subprocess.run(["tsh", "ssh", target, "cat /tmp/ahedd_mcp.log"], check=False)
+            raise click.ClickException(
+                f"远端 MCP server 未就绪（{target}:{port}）：确认已装本包且 AHEDD_CC_PYTHON 正确"
+            )
+
     try:
         if tool_mode == "mcp":
             import shlex as _shlex
-            import socket
             import subprocess
             import sys
-            import time as _time
             from pathlib import Path
 
             _ssh_target = os.environ.get("AHEDD_CC_SSH")
             if adapter == "claude-code" and _ssh_target:
                 # 远端拓扑：MCP server 与 CC 同机（dev01）。
                 # （tsh 不支持 ssh -R 反向转发，本地 server 无法暴露给 dev01）
-                remote_python = os.environ.get("AHEDD_CC_PYTHON", "python")
-                remote_events = "/tmp/ahedd_mcp_events.jsonl"
-                subprocess.run(
-                    ["tsh", "ssh", _ssh_target,
-                     (f"rm -f {remote_events}; nohup {_shlex.quote(remote_python)} -m ahedd.mcp "
-                      f"--dataset {dataset} --http --port {mcp_port} --events-file {remote_events} "
-                      ">/tmp/ahedd_mcp.log 2>&1 &")],
-                    capture_output=True, timeout=60, check=False,
-                )
-                ready = subprocess.run(
-                    ["tsh", "ssh", _ssh_target,
-                     f"for i in $(seq 1 40); do ss -tln | grep -q ':{mcp_port} ' && exit 0; sleep 0.5; done; exit 1"],
-                    capture_output=True, timeout=90, check=False,
-                )
-                if ready.returncode != 0:
-                    subprocess.run(["tsh", "ssh", _ssh_target, "cat /tmp/ahedd_mcp.log"], check=False)
-                    raise click.ClickException(
-                        "远端 MCP server 未就绪：请确认 dev01 已安装本包（pip install 'agentharness-edd[mcp]'）"
-                        "且 AHEDD_CC_PYTHON 指向正确解释器"
-                    )
-                _mcp_events_file = remote_events
+                _remote_python = os.environ.get("AHEDD_CC_PYTHON", "python")
+                _remote_events = "/tmp/ahedd_mcp_events.jsonl"
+                _mcp_events_file = _remote_events
                 _mcp_events_ssh = _ssh_target
                 _cleanup_cmds.append(f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true")
-                click.echo(f"# mcp server (remote): {_ssh_target}:{mcp_port} events={remote_events}")
+
+                def _case_setup(case):
+                    subprocess.run(
+                        ["tsh", "ssh", _ssh_target,
+                         (f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true; rm -f {_remote_events}; "
+                          f"nohup {_shlex.quote(_remote_python)} -m ahedd.mcp --dataset {dataset} "
+                          f"--http --port {mcp_port} --events-file {_remote_events} "
+                          ">/tmp/ahedd_mcp.log 2>&1 &")],
+                        capture_output=True, timeout=60, check=False,
+                    )
+                    _wait_remote_ready(_ssh_target, mcp_port)
+
+                _case_setup(None)  # 首个 case 前也确保就绪
+                click.echo(f"# mcp server (remote, per-case restart): {_ssh_target}:{mcp_port}")
             else:
                 _mcp_events_file = str(Path("runs") / "mcp_events.jsonl")
                 Path(_mcp_events_file).parent.mkdir(parents=True, exist_ok=True)
-                Path(_mcp_events_file).unlink(missing_ok=True)  # 每次运行重写事件日志
-                click.echo(f"# mcp server (local): port={mcp_port} events={_mcp_events_file}")
-                server_proc = subprocess.Popen(
-                    [sys.executable, "-m", "ahedd.mcp", "--dataset", dataset,
-                     "--http", "--port", str(mcp_port), "--events-file", _mcp_events_file]
-                )
-                _cleanup_procs.append(server_proc)
-                for _ in range(60):  # 等端口就绪
-                    try:
-                        socket.create_connection(("127.0.0.1", mcp_port), timeout=1).close()
-                        break
-                    except OSError:
-                        _time.sleep(0.5)
-                else:
-                    raise click.ClickException(f"MCP server 未能在端口 {mcp_port} 就绪")
-            click.echo("# 注意：MCP server 共享单环境实例，多 case/多 trial 会互相污染（按 case 重启待后续）")
+                _server_proc: subprocess.Popen | None = None
+
+                def _case_setup(case):
+                    nonlocal _server_proc
+                    if _server_proc is not None:
+                        _server_proc.terminate()
+                        _server_proc.wait(timeout=10)
+                    Path(_mcp_events_file).unlink(missing_ok=True)
+                    _server_proc = subprocess.Popen(
+                        [sys.executable, "-m", "ahedd.mcp", "--dataset", dataset,
+                         "--http", "--port", str(mcp_port), "--events-file", _mcp_events_file]
+                    )
+                    _cleanup_procs.append(_server_proc)
+                    _wait_local_port(mcp_port)
+
+                _case_setup(None)
+                click.echo(f"# mcp server (local, per-case restart): port={mcp_port}")
 
         pairs = asyncio.run(
             run_dataset(
@@ -208,8 +239,9 @@ def run_cmd(
                 trials=trials,
                 dataset=dataset,
                 agent_model=roles.agent.model,
-                concurrency=concurrency,
+                concurrency=1 if tool_mode == "mcp" else concurrency,  # per-case server 重启需串行
                 on_result=_print_result,
+                case_setup=_case_setup,
             )
         )
     finally:
@@ -322,10 +354,147 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
 
 
 @main.command("report")
-@click.option("--run", "run_id", required=True, help="run 目录或 run_id")
-def report_cmd(run_id: str) -> None:
-    """生成单文件 HTML 诊断报告。"""
-    click.echo("脚手架阶段：ahedd report 于 D4 里程碑实现。")
+@click.option("--runs", "runs_dir", default="runs", show_default=True, help="轨迹目录")
+@click.option("--out", default="report.html", show_default=True)
+def report_cmd(runs_dir: str, out: str) -> None:
+    """生成单文件 HTML 诊断报告（轨迹回放 + rubric 判分 + 环境 diff）。"""
+    import json as _json
+    from pathlib import Path
+
+    from ahedd.report.html import render_report
+    from ahedd.trace.schema import load_jsonl_trajectory
+
+    items = []
+    for trace_file in sorted(Path(runs_dir).rglob("*.jsonl")):
+        try:
+            t = load_jsonl_trajectory(str(trace_file))
+            if not t.meta.task_id:
+                continue
+        except Exception:  # noqa: BLE001, S112 - 跳过事件日志等非轨迹文件
+            continue
+        score = None
+        sidecar = trace_file.with_suffix(".score.json")
+        if sidecar.exists():
+            try:
+                score = _json.loads(sidecar.read_text(encoding="utf-8"))
+            except _json.JSONDecodeError:
+                score = None
+        env_diff = {}
+        diff_sidecar = trace_file.with_suffix(".envdiff.json")
+        if diff_sidecar.exists():
+            try:
+                env_diff = _json.loads(diff_sidecar.read_text(encoding="utf-8"))
+            except _json.JSONDecodeError:
+                env_diff = {}
+        items.append(
+            {
+                "meta": t.meta.model_dump(),
+                "steps": [s.model_dump(exclude_none=True) for s in t.steps],
+                "score": score,
+                "env_diff": env_diff,
+            }
+        )
+    if not items:
+        raise click.UsageError(f"{runs_dir} 下没有轨迹文件")
+    out_path = render_report(items, out)
+    click.echo(f"report -> {out_path} ({len(items)} traces)")
+
+
+@main.command("freeze")
+@click.argument("trace", default="")
+@click.option("--dataset", default=None, help="缺省取轨迹 meta.dataset")
+@click.option("--attribution", default=None, help="人工归因标签（缺省自动预判）")
+def freeze_cmd(trace: str, dataset: str | None, attribution: str | None) -> None:
+    """把失败轨迹冻结为回归用例（regressions/cases/RC-xxxx.yaml + 基线轨迹副本）。"""
+    import datetime as _dt
+    import shutil
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    from ahedd.datasets import get_dataset
+    from ahedd.regression.schema import Attribution, RegressionCase
+    from ahedd.scoring.trajectory_metrics import compute_trajectory_metrics
+    from ahedd.trace.schema import load_jsonl_trajectory
+
+    p = _locate_trace(trace)
+    t = load_jsonl_trajectory(str(p))
+    ds = dataset or t.meta.dataset or "mock"
+    provider = get_dataset(ds)
+    case = next((c for c in provider.load(t.meta.domain) if c.id == t.meta.task_id), None)
+    if case is None:
+        raise click.UsageError(f"任务 {t.meta.task_id} 不在数据集 {ds} 的 {t.meta.domain} 域中")
+
+    metrics = compute_trajectory_metrics(t)
+    label = attribution or _triage(t, metrics)
+
+    cases_dir = Path("regressions/cases")
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(cases_dir.glob("RC-*.yaml"))
+    next_id = f"RC-{len(existing) + 1:04d}"
+
+    trace_copy = Path("regressions/traces") / t.meta.task_id / f"{t.meta.run_id}.jsonl"
+    trace_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(p, trace_copy)
+
+    rc = RegressionCase(
+        id=next_id,
+        source_run=str(p),
+        domain=t.meta.domain,
+        dataset=ds,
+        env_seed=case.env_seed,
+        instruction=case.instruction,
+        user_scenario=case.user_scenario.model_dump() if case.user_scenario else None,
+        rubrics=case.rubrics,
+        rules=case.rules.model_dump(),
+        attribution=Attribution(primary=label),
+        baseline_trace=str(trace_copy).replace("\\", "/"),
+        created_by="human" if attribution else "auto",
+        created_at=_dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
+    out = cases_dir / f"{next_id}.yaml"
+    out.write_text(_yaml.safe_dump(rc.model_dump(), allow_unicode=True, sort_keys=False), encoding="utf-8")
+    click.echo(f"frozen -> {out} (attribution={label}, baseline={trace_copy})")
+
+
+def _locate_trace(trace: str) -> Path:
+    """轨迹定位：路径直接用；否则按 run_id / case_id 在 runs/ 下搜（取最新）。"""
+    from pathlib import Path
+
+    if trace:
+        p = Path(trace)
+        if p.exists():
+            return p
+        hits = sorted(
+            (f for f in Path("runs").rglob(f"*{trace}*.jsonl")
+             if not f.name.endswith((".score.json", ".envdiff.json"))),
+            key=lambda f: f.stat().st_mtime,
+        )
+        if not hits:
+            raise click.UsageError(f"找不到轨迹：{trace}")
+        return hits[-1]
+    hits = sorted(
+        (f for f in Path("runs").rglob("*.jsonl")
+         if not f.name.endswith((".score.json", ".envdiff.json"))),
+        key=lambda f: f.stat().st_mtime,
+    )
+    if not hits:
+        raise click.UsageError("runs/ 下没有轨迹")
+    return hits[-1]
+
+
+def _triage(t: Any, metrics: Any) -> str:
+    """自动归因预判（人工可用 --attribution 覆盖）。"""
+    errors = [s for s in t.steps if s.type == "error"]
+    if any("loop" in (s.stop_reason or "") or "loop detected" in s.content for s in errors):
+        return "tool.loop"
+    if any(s.stop_reason == "max_steps" for s in errors):
+        return "reasoning.unfinished"
+    if metrics.malformed_args_calls > 0 or metrics.unknown_tool_calls > 0:
+        return "tool.param"
+    if metrics.failed_calls > 0 or metrics.error_events > 0:
+        return "tool"
+    return "reasoning.constraint"
 
 
 @main.group("mcp")
@@ -352,13 +521,6 @@ def mcp_serve_cmd(dataset: str, domain: str | None, host: str, port: int, stdio:
         port=port,
         events_path=events_file,
     )
-
-
-@main.command("freeze")
-@click.argument("run_id")
-def freeze_cmd(run_id: str) -> None:
-    """把失败轨迹冻结为回归用例（regressions/cases/RC-xxxx.yaml）。"""
-    click.echo("脚手架阶段：ahedd freeze 于 D4 里程碑实现。")
 
 
 @main.command("ci")

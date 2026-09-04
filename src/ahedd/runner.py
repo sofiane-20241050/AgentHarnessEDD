@@ -39,12 +39,17 @@ async def run_dataset(
     agent_model: str = "",
     concurrency: int = 1,
     on_result: Callable[[TaskCase, CaseOutcome, int], None] | None = None,
+    case_setup: Callable[[TaskCase], Any] | None = None,
 ) -> list[tuple[TaskCase, CaseOutcome]]:
     """批量跑一个数据集域：每任务独立环境、独立适配器实例；trials 次采样（Pass^k 基础）。
 
     :param concurrency: 并发上限（信号量）。环境互不共享、轨迹各写各文件，天然隔离。
     :param on_result: 每完成一条立即回调 (case, outcome, trial)——进度展示用。
+    :param case_setup: 每个任务开始前调用（同步或 async）——如 MCP server 按 case 重启；
+        与并发互斥（per-case 全局资源只能串行）。
     """
+    if case_setup is not None and concurrency > 1:
+        raise ValueError("case_setup（按 case 重启等）与 concurrency>1 互斥")
     domain = domain or provider.domains()[0]
     cases = provider.load(domain)
     if case_ids:
@@ -54,6 +59,10 @@ async def run_dataset(
 
     async def _run_one(case: TaskCase, trial: int) -> tuple[TaskCase, CaseOutcome]:
         async with semaphore:
+            if case_setup is not None and trial == 1:
+                maybe_await = case_setup(case)
+                if maybe_await is not None and hasattr(maybe_await, "__await__"):
+                    await maybe_await
             env = provider.build_environment(domain)
             outcome = await run_case(
                 dataset=dataset or provider.name,
@@ -140,4 +149,11 @@ async def run_case(
         outcome.env_diff = env.diff(before, env.snapshot())
     path = f"{trace_dir}/{env.domain}/{task_id}/{meta.run_id}.jsonl"
     recorder.dump_jsonl(path)
+    # 环境终态 diff 旁车持久化（报告/回归冻结消费）
+    import json as _json
+    from pathlib import Path as _P
+
+    _P(path).with_suffix(".envdiff.json").write_text(
+        _json.dumps(outcome.env_diff, ensure_ascii=False, default=str), encoding="utf-8"
+    )
     return outcome

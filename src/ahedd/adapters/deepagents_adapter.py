@@ -74,6 +74,9 @@ class DeepAgentsAdapter:
         subagents: Any = None,
         create_kwargs: dict[str, Any] | None = None,
         harness_tool_kinds: dict[str, str] | None = None,
+        tool_mode: str = "fc",
+        mcp_url: str = "http://127.0.0.1:8023/mcp",
+        events_file: str | None = None,
     ) -> None:
         """模型与 Harness 组装解耦：
         :param model_spec: 端点配置（经 llm.build_langchain_model 桥接为 ChatOpenAI）
@@ -82,6 +85,10 @@ class DeepAgentsAdapter:
         :param subagents: 自定义 SubAgent 列表
         :param create_kwargs: 其余 create_deep_agent 参数透传（backend/skills/memory/...）
         :param harness_tool_kinds: 内置工具 -> 轨迹 type 的映射覆盖
+        :param tool_mode: "fc" = 工具直注入（默认）；"mcp" = 经 langchain-mcp-adapters 连接
+            环境的 MCP server（与其他车道统一工具注入层），需先 `ahedd mcp serve`
+        :param mcp_url / events_file: MCP 模式参数（events_file 为 server 事件日志，
+            跑完合并入轨并提供环境终态 diff）
         """
         if model is None and model_spec is None:
             raise ValueError("model_spec 与 model 至少提供一个")
@@ -96,6 +103,9 @@ class DeepAgentsAdapter:
         self.harness_tool_kinds = dict(DEFAULT_HARNESS_TOOL_KINDS)
         if harness_tool_kinds:
             self.harness_tool_kinds.update(harness_tool_kinds)
+        self.tool_mode = tool_mode
+        self.mcp_url = mcp_url
+        self.events_file = events_file
 
     # ---- 组装 ----
 
@@ -143,12 +153,24 @@ class DeepAgentsAdapter:
         model = self.model if self.model is not None else build_langchain_model(
             self.model_spec, disable_thinking=self.disable_thinking  # type: ignore[arg-type]
         )
-        agent = create_deep_agent(
-            model=model,
-            tools=[self._to_lc_tool(t) for t in tools],
-            system_prompt=task.system_prompt or self.system_prompt,
-            **extra,
-        )
+        if self.tool_mode == "mcp":
+            # MCP 模式：工具经 langchain-mcp-adapters 从环境 MCP server 获取（统一注入层）。
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+
+            client = MultiServerMCPClient({"ahedd": {"transport": "streamable_http", "url": self.mcp_url}})
+            lc_tools = await client.get_tools()
+            env_tool_names = {t.name for t in lc_tools}
+            agent = create_deep_agent(
+                model=model, tools=lc_tools,
+                system_prompt=task.system_prompt or self.system_prompt, **extra,
+            )
+        else:
+            agent = create_deep_agent(
+                model=model,
+                tools=[self._to_lc_tool(t) for t in tools],
+                system_prompt=task.system_prompt or self.system_prompt,
+                **extra,
+            )
 
         try:
             result = await agent.ainvoke(
@@ -165,9 +187,23 @@ class DeepAgentsAdapter:
             return AgentResult(final_message="", stop_reason="max_steps")
 
         steps, final_text, usage_total = _rebuild_steps(result["messages"], env_tool_names, self.harness_tool_kinds)
+        env_diff: dict[str, Any] | None = None
+        if self.tool_mode == "mcp" and self.events_file:
+            # 工具执行发生在 MCP server 进程：事件合并 + 跨进程环境终态
+            from ahedd.env.base import default_diff
+            from ahedd.mcp.server import read_server_events
+
+            server_steps, initial_state, final_state = read_server_events(self.events_file)
+            merged = [*steps]
+            for s in server_steps:
+                s.index = len(merged)
+                merged.append(s)
+            steps = merged
+            if initial_state or final_state:
+                env_diff = default_diff(initial_state, final_state)
         if recorder:
             recorder.trajectory.steps = steps  # 用重建序列替换执行期的零散记录，保证顺序与用量完整
-        return AgentResult(final_message=final_text, stop_reason="stop", usage_total=usage_total)
+        return AgentResult(final_message=final_text, stop_reason="stop", usage_total=usage_total, env_diff=env_diff)
 
 
 def _rebuild_steps(

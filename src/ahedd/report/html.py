@@ -1,22 +1,117 @@
-"""单文件 HTML 诊断报告。
+"""单文件 HTML 诊断报告（D4）。
 
-目标形态（Playwright Trace Viewer 式体验，零依赖单文件）：
-  - 轨迹时间轴回放（每轮 Thought / Action / Tool I/O）
-  - rubric 状态演化 + 违例标注
-  - 环境状态 diff（执行前后，Git-Diff 风格高亮）
-  - 失败归因标签（死循环 / schema 错误 / 越权调用 / 未澄清 ...）
-  - 指标汇总（Avg@k / Pass@k / Pass^k、轮次、token、成本）
-D4 里程碑实现（jinja2 内联模板 + 内嵌 JSON 数据）。
+零依赖单文件：数据内嵌 JSON，原生 JS 渲染——可直接发给同事或挂到任意静态服务。
+内容：套件汇总（成功率/token/指标）+ 每条轨迹的步骤时间轴（工具调用/结果/思考链）、
+rubric 判分明细（绿/红）、环境终态 diff、错误分类标注。
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+from pathlib import Path
+from typing import Any
 
-if TYPE_CHECKING:
-    from ahedd.trace.schema import Trajectory
+_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>AgentHarnessEDD 诊断报告</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f6f7f9; color: #1f2328; }
+  header { background: #1f2328; color: #fff; padding: 14px 24px; }
+  header h1 { font-size: 18px; margin: 0; }
+  main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; }
+  th, td { border: 1px solid #e1e4e8; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f0f1f3; }
+  .case { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; margin: 14px 0; }
+  .case > summary { cursor: pointer; padding: 10px 14px; font-weight: 600; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+  .pass { background: #dafbe1; color: #116329; } .fail { background: #ffebe9; color: #82071e; }
+  .muted { color: #656d76; font-weight: 400; font-size: 12px; }
+  .step-user td:first-child { background: #dafbe1; } .step-assistant td:first-child { background: #ddf4ff; }
+  .step-tool_call td:first-child { background: #fff8c5; } .step-tool_result td:first-child { background: #fffdf0; }
+  .step-error td:first-child { background: #ffebe9; } .step-plan td:first-child, .step-subagent td:first-child, .step-memory td:first-child { background: #fbefff; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .rubric { display: inline-block; margin: 2px; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .r-ok { background: #dafbe1; } .r-no { background: #ffebe9; text-decoration: line-through; }
+  details.raw { margin: 6px 14px 12px; }
+  .reasoning { color: #7c4dff; }
+  .envdiff { background: #0d1117; color: #c9d1d9; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1>AgentHarnessEDD 诊断报告 <span class="muted" style="color:#9ea7b3" id="generated"></span></h1></header>
+<main>
+  <h3>套件汇总</h3>
+  <div id="summary"></div>
+  <h3>轨迹（点击展开）</h3>
+  <div id="cases"></div>
+</main>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const DATA = JSON.parse(document.getElementById('data').textContent);
+document.getElementById('generated').textContent = ' · ' + DATA.items.length + ' 条轨迹';
+
+// 汇总表
+const adapters = {};
+for (const it of DATA.items) {
+  const a = adapters[it.meta.adapter] = adapters[it.meta.adapter] || {n:0, pass:0, tin:0, tout:0};
+  a.n++; if (it.score && it.score.passed) a.pass++;
+  a.tin += it.meta.total_usage.input_tokens; a.tout += it.meta.total_usage.output_tokens;
+}
+let rows = '<table><tr><th>adapter</th><th>runs</th><th>rubric 通过</th><th>tokens(in/out)</th></tr>';
+for (const [name, a] of Object.entries(adapters))
+  rows += `<tr><td>${name}</td><td>${a.n}</td><td>${a.pass}/${a.n}</td><td>${a.tin.toLocaleString()} / ${a.tout.toLocaleString()}</td></tr>`;
+document.getElementById('summary').innerHTML = rows + '</table>';
+
+// 轨迹卡片
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const trunc = (s, n=400) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s; };
+
+for (const it of DATA.items) {
+  const m = it.meta;
+  const badge = it.score ? (it.score.passed ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>') : '<span class="badge" style="background:#eee">未判分</span>';
+  const rub = it.score && it.score.rubric_results
+    ? `rubric ${it.score.rubric_results.filter(r=>r.satisfied).length}/${it.score.rubric_results.length}` : '';
+  const det = document.createElement('details');
+  det.className = 'case';
+  det.innerHTML = `<summary>${badge} <span>${esc(m.task_id)}</span>
+      <span class="muted">${esc(m.adapter)} · ${esc(m.agent_model||'')}</span>
+      <span class="muted">${rub}</span>
+      <span class="muted">${m.total_usage.input_tokens.toLocaleString()}/${m.total_usage.output_tokens.toLocaleString()} tok · ${it.steps.length} 步</span></summary>
+    <div style="padding:0 14px 10px">${
+      it.score && it.score.rubric_results ? '<div style="margin:6px 0">' +
+        it.score.rubric_results.map(r => `<span class="rubric ${r.satisfied?'r-ok':'r-no'}" title="${esc(r.description)}">${r.satisfied?'✓':'✗'} ${esc(trunc(r.description, 40))}</span>`).join('') + '</div>' : ''
+    }${
+      it.env_diff && Object.keys(it.env_diff).length ? `<details class="raw"><summary>环境终态 diff</summary><div class="envdiff">${esc(JSON.stringify(it.env_diff, null, 1))}</div></details>` : ''
+    }
+    <table><tr><th style="width:90px">#</th><th style="width:110px">类型</th><th>内容 / 工具</th></tr>${
+      it.steps.map(s => {
+        let body = '';
+        if (s.type === 'tool_call') body = `<span class="mono">${esc(s.tool_name)}(${esc(JSON.stringify(s.tool_args??{}))})</span>`;
+        else if (s.type === 'tool_result') body = `<span class="mono">${esc(s.tool_name)} → ${esc(trunc(JSON.stringify(s.tool_result), 300))}</span>`;
+        else if (s.type === 'error') body = `<span style="color:#82071e">${esc(s.content)} <span class="muted">[${esc(s.error_kind||'')}]</span></span>`;
+        else body = esc(trunc(s.content, 500)) + (s.reasoning ? `<div class="reasoning mono" style="margin-top:4px">💭 ${esc(trunc(s.reasoning, 300))}</div>` : '');
+        return `<tr class="step-${s.type}"><td>${s.index}</td><td>${s.type}</td><td>${body}</td></tr>`;
+      }).join('')
+    }</table></div>`;
+  document.getElementById('cases').appendChild(det);
+}
+</script>
+</body>
+</html>
+"""
 
 
-def render_report(trajectories: list[Trajectory], out_path: str) -> str:
-    """渲染并写出单文件 HTML 报告，返回文件路径。"""
-    raise NotImplementedError("HTML 诊断报告于 D4 里程碑实现")
+def render_report(items: list[dict[str, Any]], out_path: str = "report.html") -> str:
+    """渲染单文件 HTML 报告。
+
+    :param items: 每项 {"meta": RunMeta dict, "steps": [...], "score": sidecar dict | None, "env_diff": dict}
+    """
+    payload = json.dumps({"items": items}, ensure_ascii=False, default=str)
+    html = _TEMPLATE.replace("__DATA__", payload)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return str(out)
