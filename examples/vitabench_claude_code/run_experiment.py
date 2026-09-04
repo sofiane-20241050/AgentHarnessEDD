@@ -22,14 +22,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from ahedd.adapters.claude_code_adapter import ClaudeCodeAdapter  # noqa: E402
-from ahedd.config import load_dotenv, load_models_config  # noqa: E402
-from ahedd.datasets import get_dataset  # noqa: E402
-from ahedd.llm import make_client  # noqa: E402
-from ahedd.report.html import render_report  # noqa: E402
-from ahedd.runner import run_dataset  # noqa: E402
-from ahedd.scoring import RubricSlidingWindowScorer, compute_trajectory_metrics  # noqa: E402
-from ahedd.user import UserSimulator  # noqa: E402
+from ahedd.adapters.claude_code_adapter import ClaudeCodeAdapter
+from ahedd.config import load_dotenv, load_models_config
+from ahedd.datasets import get_dataset
+from ahedd.llm import make_client
+from ahedd.report.html import render_report
+from ahedd.runner import run_dataset
+from ahedd.scoring import RubricSlidingWindowScorer, compute_trajectory_metrics
+from ahedd.user import UserSimulator
 
 MCP_PORT = 8023
 
@@ -67,7 +67,7 @@ async def main() -> None:
             events_ssh_target=os.environ.get("AHEDD_CC_SSH") or None,
         )
 
-    def sim_factory(case):  # noqa: ANN001, ANN202
+    def sim_factory(case):
         if roles.user_simulator is None:
             return None
         return UserSimulator(
