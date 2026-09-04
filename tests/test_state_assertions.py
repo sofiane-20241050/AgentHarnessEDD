@@ -59,4 +59,6 @@ async def test_judge_prompt_contains_official_elements(tmp_path):
     assert report.passed is True
     assert "帮我点份清淡米线" in captured["user"]          # 任务指令入 prompt
     assert "2025-06-21 11:20:00" in captured["user"]      # 环境时间入 prompt
-    assert "订单类 rubric" in captured["system"]            # 官方订单确认硬规则
+    assert "订单类评分项" in captured["system"]              # 官方订单确认硬规则
+    assert "真实完成了下单操作" in captured["system"]         # 官方防假阳性措辞
+    assert "推翻了之前的正确结论" in captured["system"]        # 官方有条件可逆规则

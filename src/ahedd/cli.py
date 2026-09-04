@@ -322,7 +322,9 @@ def run_cmd(
 @click.option("--models", "models_yaml", default=None, help="models.yaml 路径（缺省用 .env/环境变量）")
 @click.option("--no-judge", is_flag=True, help="只算确定性指标，跳过 LLM 判分")
 @click.option("--think", is_flag=True, help="判分模型开启思考（默认关闭以保证 JSON 输出）")
-def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bool, think: bool) -> None:
+@click.option("--strict-state", is_flag=True, help="强制开启终态断言（expected_states 字段级比对；官方基准默认关闭以对齐论文口径）")
+@click.option("--no-state-check", is_flag=True, help="强制关闭终态断言")
+def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bool, think: bool, strict_state: bool, no_state_check: bool) -> None:
     """离线判分：读轨迹 -> rubric 滑窗 judge + 轨迹动力学指标 -> 结果落盘（先存后判）。"""
     import asyncio
     import json as _json
@@ -378,11 +380,14 @@ def score_cmd(runs_dir: str, dataset: str, models_yaml: str | None, no_judge: bo
         state_violations: list = []
         if scorer is not None and case.rubrics:
             report = asyncio.run(scorer.score(case, trajectory))
-            # 终态断言（增强通道）：终态快照旁车 + expected_states 确定性比对
+            # 终态断言策略：显式 flag > 数据集策略
+            # vita（官方基准）默认关闭以对齐论文口径（官方 evaluator 不消费 final_state）；
+            # 自定义数据集默认开启（expected_states 由数据集作者自行定义，属增强保障）
+            _state_on = strict_state if strict_state else (not no_state_check and dataset != "vita")
             state_file = trace_file.with_suffix(".envstate.json")
             ec = (getattr(case, "extra", None) or {}).get("evaluation_criteria") or {}
             expected = ec.get("expected_states") if isinstance(ec, dict) else None
-            if state_file.exists() and expected:
+            if _state_on and state_file.exists() and expected:
                 import json as _j2
 
                 try:
