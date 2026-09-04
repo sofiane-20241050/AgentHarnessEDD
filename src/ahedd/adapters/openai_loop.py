@@ -30,6 +30,7 @@ class OpenAILoopAdapter:
         system_prompt: str | None = DEFAULT_SYSTEM_PROMPT,
         max_turns: int = 300,
         chat_kwargs: dict[str, Any] | None = None,
+        max_identical_calls: int = 5,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -37,6 +38,9 @@ class OpenAILoopAdapter:
         # 透传给 client.chat 的额外参数，如 max_tokens / extra_body
         # （vLLM 思考模型可用 extra_body={"chat_template_kwargs": {"enable_thinking": False}}）
         self.chat_kwargs = chat_kwargs or {}
+        # 循环熔断：同一工具连续调用超过该次数即中止（同参重复或参数变体轮换都算，
+        # 防"失败不恢复"死循环；合法翻页等场景通常 < 10）
+        self.max_identical_calls = max(10, max_identical_calls)
 
     async def run(
         self,
@@ -51,6 +55,8 @@ class OpenAILoopAdapter:
 
         registry = ToolRegistry(tools)
         total = Usage()
+        last_tool_name: str | None = None
+        streak = 0
 
         for _turn in range(self.max_turns):
             try:
@@ -99,6 +105,26 @@ class OpenAILoopAdapter:
                     "assistant", content=resp.content or "", reasoning=resp.reasoning_content, usage=resp.usage
                 )
             for tc in resp.tool_calls:
+                streak = streak + 1 if tc.name == last_tool_name else 1
+                last_tool_name = tc.name
+                if streak > self.max_identical_calls:
+                    if recorder:
+                        recorder.note(
+                            "error",
+                            content=f"loop detected: {tc.name} x{streak} identical calls (circuit breaker)",
+                            tool_name=tc.name,
+                            error_kind="agent",
+                            stop_reason="loop_detected",
+                        )
+                    return AgentResult(
+                        final_message="",
+                        stop_reason="loop_detected",
+                        usage_total={
+                            "input_tokens": total.input_tokens,
+                            "output_tokens": total.output_tokens,
+                            "cost_usd": total.cost_usd,
+                        },
+                    )
                 messages.append(await self._execute(tc, registry, recorder))
 
         if recorder:
@@ -131,6 +157,8 @@ class OpenAILoopAdapter:
             if recorder:
                 recorder.note("error", content=f"TypeError: {exc}", tool_name=tc.name, error_kind="agent")
             return _tool_message(tc.id, {"ok": False, "error": f"bad arguments: {exc}"})
+        except Exception as exc:  # noqa: BLE001 - 工具业务异常：错误回传模型供其恢复（wrapper 已入轨）
+            return _tool_message(tc.id, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 def _assistant_message(resp: Any) -> dict[str, Any]:

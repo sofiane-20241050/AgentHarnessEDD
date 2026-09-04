@@ -39,7 +39,7 @@ def _load_builtin_datasets() -> None:
     """导入内置数据集模块以触发自注册（mock 为框架自测域，vita 于 D1 接入）。"""
     from importlib import import_module
 
-    for mod in ("ahedd.datasets.mock",):
+    for mod in ("ahedd.datasets.mock", "ahedd.datasets.vita"):
         try:
             import_module(mod)
         except ImportError:

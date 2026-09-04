@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ class TaskCase(BaseModel):
     rules: TrajectoryRules = Field(default_factory=TrajectoryRules)
     env_seed: int | None = None
     source: str = ""                    # 数据来源标记：vitabench / private / ...
+    extra: dict[str, Any] = Field(default_factory=dict)  # 域特定数据（如 vita 的 expected_states 确定性断言原料）
 
 
 @runtime_checkable
