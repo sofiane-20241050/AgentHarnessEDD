@@ -34,7 +34,7 @@ class _force_utf8_open:
     本上下文管理器在"导入 vita / 读任务文件 / 执行工具"期间兜底，不修改第三方代码。
     """
 
-    def __enter__(self) -> _force_utf8_open:
+    def __enter__(self) -> "_force_utf8_open":  # noqa: PYI034 - 返回类型即 self，ruff 误报于前向引用
         import builtins
 
         self._original = builtins.open

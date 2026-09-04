@@ -57,7 +57,10 @@ def build_env_server(
 
     log = ServerEventLog(events_path) if events_path else None
     if log:
-        log.write({"type": "env_state", "state": env.snapshot()})
+        try:
+            log.write({"type": "env_state", "state": env.snapshot()})
+        except Exception:  # noqa: BLE001, S110 - 尚未 reset 的任务态环境：初始快照跳过（reset 由 run_server 负责）
+            pass
 
     server = FastMCP(server_name, host=host, port=port)
 
@@ -146,12 +149,20 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8023,
     events_path: str | Path | None = None,
+    env_seed: int | None = None,
 ) -> None:
-    """构建并运行一个数据集环境的 MCP server（阻塞）。"""
+    """构建并运行一个数据集环境的 MCP server（阻塞）。
+
+    :param env_seed: 任务级初始态索引（如 vita 的任务序号）。任务态数据集必须指定；
+        缺省 0。按 case 重启的编排方（CLI）会为每个任务传各自的 seed。
+    """
+    import asyncio
+
     from ahedd.datasets import get_dataset
 
     provider = get_dataset(dataset)
     domain = domain or provider.domains()[0]
     env = provider.build_environment(domain)
+    asyncio.run(env.reset(env_seed if env_seed is not None else 0))
     server = build_env_server(env, events_path=events_path, host=host, port=port)
     server.run(transport="stdio" if transport == "stdio" else "streamable-http")

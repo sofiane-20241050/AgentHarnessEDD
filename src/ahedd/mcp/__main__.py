@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8023)
     parser.add_argument("--events-file", default=None, help="工具/环境事件日志（JSONL），供轨迹合并")
+    parser.add_argument("--env-seed", type=int, default=None, help="任务级初始态索引（如 vita 的任务序号）")
     args = parser.parse_args()
 
     from ahedd.mcp.server import run_server
@@ -26,6 +27,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         events_path=args.events_file,
+        env_seed=args.env_seed,
     )
 
 

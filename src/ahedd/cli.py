@@ -201,9 +201,11 @@ def run_cmd(
                 def _case_setup(case):
                     subprocess.run(
                         ["tsh", "ssh", _ssh_target,
-                         (f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true; rm -f {_remote_events}; "
+                         (f"pkill -f 'ahedd.mcp.*--port {mcp_port}' || true; "
+                          f"rm -f {_remote_events} /tmp/ahedd_mcp.log; "
                           f"nohup {_shlex.quote(_remote_python)} -m ahedd.mcp --dataset {dataset} "
                           f"--http --port {mcp_port} --events-file {_remote_events} "
+                          f"--env-seed {getattr(case, 'env_seed', 0) or 0} "
                           ">/tmp/ahedd_mcp.log 2>&1 &")],
                         capture_output=True, timeout=60, check=False,
                     )
@@ -224,7 +226,8 @@ def run_cmd(
                     Path(_mcp_events_file).unlink(missing_ok=True)
                     _server_proc = subprocess.Popen(
                         [sys.executable, "-m", "ahedd.mcp", "--dataset", dataset,
-                         "--http", "--port", str(mcp_port), "--events-file", _mcp_events_file]
+                         "--http", "--port", str(mcp_port), "--events-file", _mcp_events_file,
+                         "--env-seed", str(getattr(case, "env_seed", 0) or 0)]
                     )
                     _cleanup_procs.append(_server_proc)
                     _wait_local_port(mcp_port)
